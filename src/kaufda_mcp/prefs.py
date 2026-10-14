@@ -42,6 +42,9 @@ class PreferenceStore:
     def stores(self) -> list[str]:
         return list(self.load().get("stores") or [])
 
+    def apps(self) -> list[str]:
+        return list(self.load().get("apps") or [])
+
     def radius_km(self) -> float:
         value = self.load().get("max_distance_km")
         return float(value) if value is not None else DEFAULT_RADIUS_KM

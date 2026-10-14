@@ -31,7 +31,9 @@ near a location. All prices in EUR, dates in Europe/Berlin.
 Workflow:
 1. Call get_preferences first. If no location is stored, ask the user for PLZ/Ort and call \
 set_preferences(location=...). Also store the shops the user likes (set_preferences(stores=[...])); \
-searches are then limited to those shops by default (only_favorites=true).
+searches are then limited to those shops by default (only_favorites=true). Ask once which retailer apps / \
+loyalty cards the user uses (Lidl Plus, PENNY App, Kaufland Card, REWE App, EDEKA App, Netto App, PAYBACK, \
+...) and save them with set_preferences(apps=[...]).
 2. search_offers for single products, shopping_list for several items at once.
 3. Validity is evaluated per offer against the current date ("today" in every answer): many offers \
 start mid-week (e.g. Thursday) and next week's brochures are often already online. Every offer has \
@@ -39,8 +41,15 @@ valid_from/valid_until, valid_today and a status like "aktiv", "aktiv, endet heu
 "demnächst, ab morgen Do 15.10.". Never present an offer with valid_today=false as available today, \
 always say from which day it applies. If the user names a shopping day, pass valid_on (e.g. "Donnerstag"); \
 for shopping today use when="now". shopping_list returns a shopping_window per store (the days on which \
-all picks of that store are valid together). Offers with conditions ("Nur mit App", "Mit Lidl Plus", \
-"ab 2 Stück") or conditional_prices only apply under that condition.
+all picks of that store are valid together).
+3b. Prices: `price` is what everybody pays in the store. `app_price` (with `program`, e.g. "PENNY App", \
+"Lidl Plus", "Kaufland Card") only applies with that app/card; `app_only`=true means the advertised price \
+needs the app and `price` is then the normal price (if known). `your_price` (+ `your_price_basis`) is the \
+price for THIS user based on the saved apps; rankings and totals use it. Mention app prices the user could \
+get with an app they do not have. `points_price` needs collected loyalty points, `multi_buy` needs a minimum \
+quantity, `online_only` offers are not sold in stores, `app_bonus` (REWE Bonus) is credit for later, not a \
+discount, `app_note` marks app coupons / PAYBACK actions. Other `conditions` (e.g. "An unserer Theke") apply \
+as stated.
 4. To show or verify an offer use its cutout_url (kaufDA's clipping from the brochure incl. price) or call \
 view_offer, which returns that clipping as an image (mode="context" adds the surroundings when the price or \
 a date banner is cut off). Never present any other picture as the offer. view_brochure_page shows the whole \
@@ -142,7 +151,7 @@ async def _viewer_index(brochure_ids: set[str], loc: dict[str, Any]) -> dict[str
 
 
 async def _search(query: str, loc: dict[str, Any], *, wanted: list[str], when: str, valid_on,
-                  radius: float, sort: str, exact_validity: bool) -> dict[str, Any]:
+                  radius: float, sort: str, exact_validity: bool, apps: list[str]) -> dict[str, Any]:
     raw = await client.search(query, loc["lat"], loc["lng"], limit=100,
                               sort="price" if sort == "price" else None)
     contents = raw.get("contents") or {}
@@ -196,11 +205,10 @@ async def _search(query: str, loc: dict[str, Any], *, wanted: list[str], when: s
         detail = viewer.get(item.get("id"))
         if detail:
             validity = N.viewer_validity(detail) or validity
-            deals = N.deals_summary(detail.get("deals") or [])
-            if deals.get("price"):
+            deals = N.deals_summary(detail.get("deals") or [], offer.get("retailer"))
+            if deals.get("price") or deals.get("app_price") or deals.get("points_price"):
                 # The search index flattens deals and may show an app-only price as the main price.
-                for key in ("price", "price_text", "unit_price", "unit_price_value", "conditions",
-                            "conditional_prices", "regular_price", "uvp", "price_note"):
+                for key in N.PRICE_KEYS:
                     offer.pop(key, None)
                 offer.update(deals)
                 N.estimate_unit_price(offer)
@@ -208,6 +216,7 @@ async def _search(query: str, loc: dict[str, Any], *, wanted: list[str], when: s
             hidden_time += 1
             continue
         offer.update(validity.describe(now))
+        N.personalize(offer, apps)
         key = (offer.get("retailer"), offer.get("product"), offer.get("brand"), offer.get("price"),
                offer.get("valid_from"))
         if key in seen:
@@ -274,11 +283,13 @@ async def _search(query: str, loc: dict[str, Any], *, wanted: list[str], when: s
 
 @mcp.tool()
 async def get_preferences() -> str:
-    """Show the saved home location, favourite stores and search radius. Call this first."""
+    """Show the saved home location, favourite stores, the apps/loyalty cards the user uses and the search
+    radius. Call this first."""
     data = prefs.load()
     out = {
         "location": data.get("location"),
         "stores": data.get("stores") or [],
+        "apps": data.get("apps") or [],
         "max_distance_km": prefs.radius_km(),
         "file": str(prefs.path),
     }
@@ -286,6 +297,10 @@ async def get_preferences() -> str:
         out["hint"] = "Kein Standort gespeichert: Nutzer nach PLZ/Ort fragen und set_preferences(location=...) aufrufen."
     if not data.get("stores"):
         out["hint_stores"] = "Keine Lieblingsmärkte gespeichert: es wird bei allen Händlern gesucht."
+    if "apps" not in data:
+        out["hint_apps"] = ("Unbekannt, welche Händler Apps/Kundenkarten der Nutzer nutzt (z.B. Lidl Plus, PENNY App, "
+                            "Kaufland Card, REWE App, PAYBACK). Einmal fragen und set_preferences(apps=[...]) "
+                            "speichern; bis dahin gilt your_price ohne App.")
     return _dump(out)
 
 
@@ -298,28 +313,40 @@ async def set_preferences(
     remove_stores: Annotated[list[str] | None, Field(description="Remove stores from the favourites.")] = None,
     max_distance_km: Annotated[float | None, Field(
         description="Default search radius in km (0 = unlimited).")] = None,
+    apps: Annotated[list[str] | None, Field(
+        description="Replace the apps/loyalty cards the user uses, e.g. ['Lidl Plus', 'PENNY App', 'Kaufland Card', "
+                    "'PAYBACK'] or ['alle']. [] = none. App prices count into your_price only for these.")] = None,
+    add_apps: Annotated[list[str] | None, Field(description="Add apps/cards.")] = None,
+    remove_apps: Annotated[list[str] | None, Field(description="Remove apps/cards.")] = None,
 ) -> str:
-    """Save where the user lives and where they like to shop. Persists across sessions."""
+    """Save where the user lives, where they like to shop and which retailer apps / loyalty cards they use.
+    Persists across sessions."""
     data = prefs.load()
     if location is not None:
         try:
             data["location"] = await client.geocode(location)
         except KaufdaError as exc:
             raise ToolError(str(exc)) from exc
-    current = list(data.get("stores") or [])
-    if stores is not None:
-        current = [s.strip() for s in stores if s and s.strip()]
-    for store in add_stores or []:
-        if store.strip() and not any(N.norm(store) == N.norm(c) for c in current):
-            current.append(store.strip())
-    for store in remove_stores or []:
-        current = [c for c in current if not (N.norm(store) == N.norm(c) or N.store_matches(store, c))]
-    data["stores"] = current
+
+    def merge(current: list[str], replace: list[str] | None, add: list[str] | None,
+              remove: list[str] | None) -> list[str]:
+        if replace is not None:
+            current = [s.strip() for s in replace if s and s.strip()]
+        for entry in add or []:
+            if entry.strip() and not any(N.norm(entry) == N.norm(c) for c in current):
+                current.append(entry.strip())
+        for entry in remove or []:
+            current = [c for c in current if not (N.norm(entry) == N.norm(c) or N.store_matches(entry, c))]
+        return current
+
+    data["stores"] = merge(list(data.get("stores") or []), stores, add_stores, remove_stores)
+    if apps is not None or add_apps or remove_apps:
+        data["apps"] = merge(list(data.get("apps") or []), apps, add_apps, remove_apps)
     if max_distance_km is not None:
         data["max_distance_km"] = max(0.0, float(max_distance_km))
     prefs.save(data)
-    return _dump({"saved": True, "location": data.get("location"), "stores": current,
-                  "max_distance_km": prefs.radius_km()})
+    return _dump(N.compact({"saved": True, "location": data.get("location"), "stores": data["stores"],
+                            "apps": data.get("apps"), "max_distance_km": prefs.radius_km()}))
 
 
 @mcp.tool()
@@ -335,16 +362,19 @@ async def search_offers(
     max_distance_km: RadiusArg = None,
     max_results: Annotated[int, Field(ge=1, le=100)] = 25,
     exact_validity: Annotated[bool, Field(
-        description="Load the brochures to get per-offer validity (e.g. offers starting Thursday) and app-only "
-                    "prices. Slightly slower.")] = True,
+        description="Load the brochures for per-offer validity (e.g. offers starting Thursday) and the full price "
+                    "data (app/card prices, multi-buy, online only). Only disable for speed; app prices may then "
+                    "be incomplete.")] = True,
 ) -> str:
-    """Search current and upcoming offers for a product near the user, with price, unit price,
-    validity period (from when / until when), retailer, brochure page and a kaufda.de link."""
+    """Search current and upcoming offers for a product near the user: store price, app/card price,
+    your_price (based on the user's apps), unit price, validity (from when / until when), retailer,
+    brochure page, cutout image and a kaufda.de link."""
     loc = await _location(location)
     wanted, scope = _store_filter(stores, only_favorites)
     try:
         result = await _search(query, loc, wanted=wanted, when=when, valid_on=_valid_on(valid_on),
-                               radius=_radius(max_distance_km), sort=sort, exact_validity=exact_validity)
+                               radius=_radius(max_distance_km), sort=sort, exact_validity=exact_validity,
+                               apps=prefs.apps())
     except (KaufdaError, ToolError) as exc:
         raise _wrap(exc) from exc
     offers = result.pop("offers")
@@ -358,11 +388,29 @@ async def search_offers(
     }))
 
 
-_SLIM_KEYS = ("offer_id", "product", "brand", "description", "retailer", "price", "price_text", "unit_price",
-              "unit_price_value",
-              "conditions", "conditional_prices", "regular_price", "uvp", "validity", "status", "valid_today",
-              "starts_in_days", "valid_from", "valid_until", "brochure_id", "page", "viewer_url", "cutout_url",
-              "distance_km")
+_SLIM_KEYS = ("offer_id", "product", "brand", "description", "retailer", "your_price", "your_price_basis",
+              "your_price_note", "price", "price_text", "unit_price", "unit_price_value", "conditions", "app_price",
+              "app_only", "points_price", "multi_buy", "online_only", "app_bonus", "app_note", "regular_price", "uvp",
+              "validity", "status", "valid_today", "starts_in_days", "valid_from", "valid_until", "brochure_id",
+              "page", "viewer_url", "cutout_url", "distance_km")
+
+
+def _price_line(offer: dict[str, Any]) -> dict[str, Any]:
+    """Short price info for the per-store overview: what the user pays plus the app hint if they lack it."""
+    your = N.effective_price(offer)
+    basis = offer.get("your_price_basis")
+    if your is None:
+        text = offer.get("your_price_note")
+    elif your == offer.get("price") and offer.get("price_text"):
+        text = offer["price_text"] + (f" ({basis})" if basis and "Normalpreis" not in offer["price_text"] else "")
+    else:
+        text = (N.fmt_eur(your) or "") + (f" ({basis})" if basis else "")
+    app = offer.get("app_price") or {}
+    hint = None
+    if app and not (basis or "").startswith("mit "):
+        hint = f"mit {app.get('program', 'App')}: {N.fmt_eur(app.get('price'))}"
+    return N.compact({"price_text": text, "app_hint": hint, "conditions": offer.get("conditions"),
+                      "app_note": offer.get("app_note"), "online_only": offer.get("online_only")})
 
 
 def _slim(offer: dict[str, Any]) -> dict[str, Any]:
@@ -419,14 +467,16 @@ async def shopping_list(
     alternatives: Annotated[int, Field(ge=0, le=5, description="Extra options per item.")] = 2,
 ) -> str:
     """Find the best current/upcoming offer for every item of a shopping list and group the picks by store.
-    Ranked by unit price where comparable, otherwise by price; category matches are preferred."""
+    Ranked by the user's price (your_price: app/card prices only if the user has that app) per unit where
+    comparable, otherwise by price; category matches are preferred, online-only offers are avoided."""
     loc = await _location(location)
     wanted, scope = _store_filter(stores, only_favorites)
     day = _valid_on(valid_on)
     radius = _radius(max_distance_km)
+    apps = prefs.apps()
     results = await asyncio.gather(
         *(_search(item, loc, wanted=wanted, when=when, valid_on=day, radius=radius, sort="relevance",
-                  exact_validity=True) for item in items),
+                  exact_validity=True, apps=apps) for item in items),
         return_exceptions=True,
     )
     per_item, by_store, missing = [], {}, []
@@ -435,7 +485,7 @@ async def shopping_list(
         if isinstance(res, BaseException):
             per_item.append({"item": item, "error": str(res)})
             continue
-        offers = res["offers"]
+        offers = [o for o in res["offers"] if not o.get("online_only")] or res["offers"]
         if not offers:
             missing.append(item)
             per_item.append(N.compact({"item": item, "found": False, "notes": res["notes"],
@@ -446,7 +496,7 @@ async def shopping_list(
             tiers.setdefault(N.relevance_tier(o, item), []).append(o)
         ranked = [o for tier in sorted(tiers) for o in _rank(tiers[tier])]
         best = ranked[0]
-        total += best.get("price") or 0.0
+        total += N.effective_price(best) or 0.0
         per_item.append(N.compact({
             "item": item,
             "match": N.RELEVANCE_LABELS[N.relevance_tier(best, item)],
@@ -455,7 +505,7 @@ async def shopping_list(
         }))
         by_store.setdefault(best.get("retailer") or "?", []).append(N.compact({
             "item": item, "product": " ".join(x for x in (best.get("brand"), best.get("product")) if x),
-            "price_text": best.get("price_text"), "conditions": best.get("conditions"),
+            **_price_line(best),
             "validity": best.get("validity"), "status": best.get("status"), "page": best.get("page"),
             "viewer_url": best.get("viewer_url"), "cutout_url": best.get("cutout_url"),
             "_from": best.get("valid_from"), "_until": best.get("valid_until"),
@@ -464,6 +514,7 @@ async def shopping_list(
         "location": loc.get("label"),
         "store_filter": scope,
         "today": N.fmt_day(N.now_berlin().date()),
+        "apps": apps or "keine gespeichert (Preise ohne App)",
         "by_store": {store: _store_plan(picks) for store, picks in by_store.items()},
         "estimated_total_eur": round(total, 2),
         "not_found": missing,
@@ -575,11 +626,12 @@ async def _load_brochure(brochure_id: str, location: str | None):
 
 def _viewer_offers(pages: list[dict[str, Any]], retailer: str | None) -> list[dict[str, Any]]:
     now = N.now_berlin()
+    apps = prefs.apps()
     out = []
     for page in pages:
         for entry in page.get("offers") or []:
             content = entry.get("content") or {}
-            offer = N.offer_from_viewer(content, retailer=retailer, now=now)
+            offer = N.personalize(N.offer_from_viewer(content, retailer=retailer, now=now), apps)
             offer.pop("brochure_id", None)
             offer["_categories"] = " ".join(
                 n.get("name", "") for p in content.get("products") or [] for n in p.get("categoryPaths") or []
@@ -711,8 +763,8 @@ async def view_offer(
             content = entry.get("content") or {}
             if (content.get("id") or "").lower() != oid:
                 continue
-            offer = N.offer_from_viewer(content, retailer=retailer)
-            area = ((content.get("parentContent") or {}).get("page") or {}).get("area")
+            offer = N.personalize(N.offer_from_viewer(content, retailer=retailer), prefs.apps())
+            area =((content.get("parentContent") or {}).get("page") or {}).get("area")
             images = {img.get("size"): img.get("url") for img in page.get("images") or []}
             blocks: list[Any] = []
             try:
@@ -760,11 +812,13 @@ def wocheneinkauf(einkaufsliste: str, woche: str = "aktuelle Woche") -> str:
     return (
         f"Plane meinen Einkauf für die {woche} mit kaufDA.\n"
         f"Einkaufsliste: {einkaufsliste}\n\n"
-        "1. Prüfe mit get_preferences Standort und Lieblingsmärkte (frag nach, falls etwas fehlt).\n"
+        "1. Prüfe mit get_preferences Standort, Lieblingsmärkte und meine Apps/Kundenkarten "
+        "(frag nach, falls etwas fehlt).\n"
         "2. Nutze shopping_list für die ganze Liste (when='upcoming' für nächste Woche).\n"
-        "3. Prüfe unsichere Treffer (match 'Textsuche') mit view_offer und sortiere Unpassendes aus.\n"
-        "4. Gib mir eine Liste pro Markt mit Preis, Gültigkeit (ab wann / bis wann), Bedingungen wie "
-        "'Nur mit App' und dem kaufDA Link. Nenne am Ende, was nirgends im Angebot ist."
+        "3. Prüfe unsichere Treffer (match mit 'prüfen!') mit view_offer und sortiere Unpassendes aus.\n"
+        "4. Gib mir eine Liste pro Markt mit meinem Preis (your_price), Gültigkeit (ab wann / bis wann), "
+        "Bedingungen wie App Preise, Treuepunkte oder Mengenrabatte und dem kaufDA Link. Sag mir, wo ich mit "
+        "einer App, die ich nicht habe, noch sparen könnte, und nenne am Ende, was nirgends im Angebot ist."
     )
 
 

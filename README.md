@@ -8,7 +8,7 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 
 * **Kein Prospekte Blättern mehr:** Die KI durchsucht alle Prospekte in deiner Nähe in Sekunden.
 * **Richtige Gültigkeit pro Angebot:** Viele Angebote gelten erst ab Donnerstag, und Prospekte der nächsten Woche sind oft schon online. Jedes Angebot hat seinen eigenen Zeitraum und einen Status bezogen auf heute, z.B. `aktiv`, `aktiv, endet heute` oder `demnächst, ab morgen Do 15.10.`.
-* **Keine Preisfallen:** Preise, die nur mit App, Kundenkarte oder ab einer Mindestmenge gelten ("Nur mit App", "Mit Lidl Plus", "ab 2 Stück"), werden getrennt ausgewiesen und nicht als normaler Preis verkauft.
+* **App Preise richtig verrechnet:** Preise mit PENNY App, Lidl Plus, Kaufland Card, REWE App, EDEKA App, Netto App, Netto plus, famila, Markant, Marktkauf und PAYBACK werden erkannt und getrennt vom Ladenpreis ausgewiesen. Du sagst der KI einmal, welche Apps du nutzt, dann rechnet sie mit deinem persönlichen Preis (`your_price`). Für Apps, die du nicht hast, zeigt sie dir nur, wie viel du damit sparen würdest. Treuepunkte Aktionen, Mengenrabatte ("ab 4 Dosen", "4 kaufen, 2 zahlen"), reine Online Angebote und REWE Bonus Guthaben werden ebenfalls erkannt und nicht als normaler Preis verkauft.
 * **Verifizierbar:** Jedes Angebot hat eine `cutout_url` auf den Ausschnitt aus dem Prospekt (mit Preis, kein reines Produktfoto). Die KI kann sich Ausschnitt, Umgebung oder die ganze Prospektseite als Bild ansehen und so Preis und Zeitraum selbst gegenprüfen. Zu jedem Treffer gibt es einen kaufDA Link auf die passende Seite.
 * **Vergleichbar:** Grundpreise (€/kg, €/l) werden ausgewertet und, wo sie fehlen, aus der Packungsgröße geschätzt.
 * **Dein Profil bleibt gespeichert:** Standort, Lieblingsmärkte und Suchradius werden lokal gespeichert und gelten für jede weitere Unterhaltung.
@@ -18,8 +18,8 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 
 | Tool | Was es macht |
 | --- | --- |
-| `get_preferences` | Gespeicherten Standort, Lieblingsmärkte und Suchradius anzeigen |
-| `set_preferences` | Standort (PLZ, Ort oder Adresse), Lieblingsmärkte und Radius speichern |
+| `get_preferences` | Gespeicherten Standort, Lieblingsmärkte, genutzte Apps/Kundenkarten und Suchradius anzeigen |
+| `set_preferences` | Standort (PLZ, Ort oder Adresse), Lieblingsmärkte, Apps/Kundenkarten und Radius speichern |
 | `search_offers` | Produkt suchen: Preis, Grundpreis, UVP oder Normalpreis, Bedingungen, Gültigkeit, Markt, Prospektseite und Link |
 | `shopping_list` | Ganze Einkaufsliste auf einmal: bestes Angebot pro Artikel, gruppiert nach Markt, mit Einkaufszeitraum und Alternativen |
 | `list_brochures` | Aktuelle und kommende Prospekte in der Nähe, mit nächster Filiale und Entfernung |
@@ -70,6 +70,7 @@ uvx --from git+https://github.com/vertexitde/kaufda-mcp kaufda-mcp --transport s
 ## So redest du mit der KI
 
 * *"Ich wohne in 24534 Neumünster und kaufe meistens bei Lidl, Edeka, Penny und Aldi."*
+* *"Ich hab die PENNY App und Lidl Plus."*
 * *"Wo gibt es diese Woche Butter am günstigsten?"*
 * *"Ich gehe Donnerstag einkaufen. Was davon ist dann im Angebot: Eier, Hackfleisch, Bananen?"*
 * *"Was hat Lidl nächste Woche im Prospekt? Zeig mir die Seite mit dem Kaffee."*

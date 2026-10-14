@@ -252,10 +252,118 @@ def _conditions(raw: Iterable[Any] | None) -> list[str]:
         elif isinstance(item, dict):
             for key, val in item.items():
                 text = str(val).strip()
-                if val in (None, [], {}) or not text:
+                if isinstance(val, bool) or val in (None, [], {}) or text.lower() in ("", "false", "true", "none", "null"):
                     continue
                 out.append(text if key == "other" else f"{key}: {text}")
     return list(dict.fromkeys(out))
+
+
+# ---------------------------------------------------------------- conditions, apps, loyalty
+
+# kaufDA mixes real conditions with unit hints ("Je", "Stück") and with labels for the price you pay
+# WITHOUT the app ("Ohne PENNY App", "Preis ohne Treuepunkte"). Rules run on norm()'d text, first match wins.
+_COND_RULES: list[tuple[str, re.Pattern[str]]] = [
+    ("noise", re.compile(r"^(je|jew|jeweils|stueck|stk|st|ab|nur|bis zu|aktion|xxl|einzelpreis|discountpreis|"
+                         r"aktionspreis|angebot|pro kg|pro stueck|auch online|je \w+|\w+ je|stueck packung|"
+                         r"1 packung|im \w*pack)$")),
+    ("no_app", re.compile(r"\bohne\b.*\b(app|karte|card|plus|treuepunkt\w*)\b|^normalpreis$|^regulaerer preis")),
+    ("points", re.compile(r"treuepunkt|sammelpunkt")),
+    ("online_only", re.compile(r"\bnur\b.*\bonline\b|online exklusiv|nur im onlineshop")),
+    ("loyalty", re.compile(r"\bapp\b|apppreis|lidl plus|netto plus|\bcard\b|\bxtra\b|payback|deutschlandcard|"
+                           r"kundenkarte|\bcoupon\b|mitgliedspreis|clubpreis")),
+    ("multi_buy", re.compile(r"\bab \d+\b|\b\d+ fuer\b|\b\d+ \d+ gratis\b|mindestens|beim kauf von|"
+                             r"^\d+ (stueck|dosen|flaschen|packungen|pack|x)$|\b\d+er pack|"
+                             r"\b\d+ (kaufen|zahlen|gratis)\b")),
+]
+
+_PROGRAMS = [
+    ("lidl", "Lidl Plus"), ("penny", "PENNY App"), ("netto marken", "Netto plus"), ("netto", "Netto App"),
+    ("kaufland", "Kaufland Card"), ("nahkauf", "REWE App"), ("rewe", "REWE App"), ("marktkauf", "Marktkauf App"),
+    ("edeka", "EDEKA App"), ("famila", "famila App"), ("markant", "Markant App"), ("rossmann", "Rossmann App"),
+    ("dm", "dm App"), ("aldi", "ALDI App"), ("globus", "Globus App"), ("norma", "NORMA App"),
+]
+_GENERIC_WORDS = {"app", "apps", "plus", "card", "karte", "kundenkarte", "der", "die", "das", "mit", "von"}
+
+
+def classify_condition(text: str | None) -> str:
+    """noise | no_app | points | online_only | loyalty | multi_buy | other"""
+    t = norm(text)
+    if not t:
+        return "noise"
+    for kind, rule in _COND_RULES:
+        if rule.search(t):
+            return kind
+    return "other"
+
+
+def _split_conditions(raw: Iterable[Any] | None) -> list[str]:
+    parts: list[str] = []
+    for text in _conditions(raw):
+        parts.extend(p.strip(" *.!") for p in re.split(r"[,;]", text) if p.strip(" *.!"))
+    return parts
+
+
+def loyalty_program(retailer: str | None, texts: Iterable[str] = ()) -> str:
+    t = norm(" ".join(texts))
+    if "payback" in t:
+        return "PAYBACK"
+    if "deutschlandcard" in t:
+        return "DeutschlandCard"
+    r = norm(retailer)
+    for key, name in _PROGRAMS:
+        if r.startswith(key):
+            return name
+    return f"{retailer} App" if retailer else "App"
+
+
+def has_app(apps: Iterable[str] | None, retailer: str | None, program: str | None) -> bool:
+    """Does the user use the app/card behind this price? apps are free text like 'Lidl Plus', 'Penny', 'alle'."""
+    prog = norm(program)
+    for entry in apps or []:
+        e = norm(entry)
+        if not e:
+            continue
+        if e in ("alle", "all", "alle apps", "jede", "ja"):
+            return True
+        if prog and e not in _GENERIC_WORDS and (e == prog or e in prog or prog in e):
+            return True
+        tokens = [t for t in e.split() if t not in _GENERIC_WORDS]
+        if retailer and any(store_matches(t, retailer) for t in tokens):
+            return True
+    return False
+
+
+def personalize(offer: dict[str, Any], apps: Iterable[str] | None) -> dict[str, Any]:
+    """Add your_price: the price this user pays, given the apps/cards they use."""
+    app = offer.get("app_price")
+    price = offer.get("price")
+    program = (app or {}).get("program")
+    if app and has_app(apps, offer.get("retailer"), program) and (price is None or app["price"] < price):
+        your, basis = app["price"], f"mit {program}"
+    elif price is not None:
+        your = price
+        basis = "ohne App, Normalpreis" if offer.get("app_only") else ("ohne App" if app else None)
+    else:
+        offer["your_price_note"] = f"Angebot nur mit {program}, Preis ohne App unbekannt"
+        return offer
+    offer["your_price"] = your
+    if basis:
+        offer["your_price_basis"] = basis
+    unit = offer.get("unit_price_value") or {}
+    ref = price if price is not None else (app or {}).get("price")
+    if unit.get("eur") is not None and ref and your != ref:
+        offer["your_unit_price"] = {"per": unit["per"], "eur": round(unit["eur"] * your / ref, 2)}
+    return offer
+
+
+def product_app_note(retailer: str | None, *texts: str | None) -> str | None:
+    """App coupons and PAYBACK actions that kaufDA only mentions in the product text."""
+    t = " ".join(x for x in texts if x)
+    if re.search(r"app[- ]?coupon", t, re.I):
+        return f"App Coupon: Rabatt nur mit {loyalty_program(retailer)}"
+    if re.search(r"payback|°\s?p\b", t, re.I):
+        return "PAYBACK Punkte Aktion (nur mit PAYBACK)"
+    return None
 
 
 # ---------------------------------------------------------------- matching
@@ -375,19 +483,33 @@ def offer_from_search(item: dict[str, Any], brochure: dict[str, Any] | None,
         item.get("validUntil") or brochure.get("validUntil"),
     )
     paths = item.get("categoryPaths") or []
+    retailer = item.get("publisherName")
+    conds = [c for c in _split_conditions(prices.get("conditions")) if classify_condition(c) not in ("noise", "no_app")]
+    app_price = None
+    if price and any(classify_condition(c) in ("loyalty", "points") for c in conds):
+        # Search index only: the advertised price needs an app/card (full deal data comes from the viewer).
+        app_price = compact({"price": price, "program": loyalty_program(retailer, conds), "conditions": conds,
+                             "unit_price": unit_text})
+        price = secondary if secondary and not prices.get("secondaryPriceIsUVP") else None
+        conds = []
+        if price is not None:  # the Grundpreis belonged to the app price
+            unit_text, unit = None, None
     out = {
         "offer_id": item.get("id"),
         "product": item.get("title"),
         "brand": item.get("brand"),
         "description": item.get("description") or prices.get("description") or None,
-        "retailer": item.get("publisherName"),
+        "retailer": retailer,
         "retailer_id": item.get("publisherId"),
         "price": price,
         "price_text": ("ab " if prices.get("priceRange") else "") + (fmt_eur(price) or "") if price else None,
         ("uvp" if prices.get("secondaryPriceIsUVP") else "regular_price"): secondary,
         "unit_price": unit_text,
         "unit_price_value": {"per": unit[0], "eur": unit[1]} if unit else None,
-        "conditions": _conditions(prices.get("conditions")),
+        "conditions": conds,
+        "app_price": app_price,
+        "app_only": True if app_price else None,
+        "app_note": product_app_note(retailer, item.get("title"), item.get("description")),
         **validity.describe(now),
         "brochure_id": bid,
         "brochure_title": brochure.get("title"),
@@ -410,52 +532,98 @@ def _path_has(paths: list[Any], category_ids: set[str]) -> bool:
     return False
 
 
-def deals_summary(deals: list[dict[str, Any]]) -> dict[str, Any]:
-    """Split kaufDA 'deals' into headline price, conditional prices and reference prices."""
-    plain, conditional, reference, notes = [], [], {}, []
+PRICE_KEYS = ("price", "price_text", "unit_price", "unit_price_value", "conditions", "regular_price", "uvp",
+              "price_note", "app_price", "app_only", "points_price", "multi_buy", "online_only", "app_bonus")
+
+
+def deals_summary(deals: list[dict[str, Any]], retailer: str | None = None) -> dict[str, Any]:
+    """Split kaufDA 'deals' into the store price for everyone, app/card prices, loyalty point prices,
+    multi-buy prices and reference prices (Normalpreis/UVP)."""
+    buckets: dict[str, list[dict[str, Any]]] = {"plain": [], "loyalty": [], "points": [], "multi_buy": []}
+    reference: dict[str, float] = {}
+    notes: list[str] = []
+    online: list[bool] = []
+    bonus = None
     for deal in deals or []:
-        kind = deal.get("type") or "OTHER"
-        low = money(deal.get("min"))
-        high = money(deal.get("max"))
-        conds = _conditions(deal.get("conditions"))
-        note = (deal.get("description") or "").strip() or None
-        entry = compact({
-            "type": DEAL_LABELS.get(kind, kind),
-            "price": low,
-            "price_max": high if high and low and high != low else None,
-            "unit_price": (deal.get("priceByBaseUnit") or "").strip("() ") or None,
-            "conditions": conds,
-            "note": note,
-        })
+        typ = deal.get("type") or "OTHER"
+        low, high = money(deal.get("min")), money(deal.get("max"))
+        kinds: set[str] = set()
+        texts: list[str] = []
+        for part in _split_conditions(deal.get("conditions")):
+            kind = classify_condition(part)
+            if kind == "noise":
+                continue
+            kinds.add(kind)
+            if kind not in ("no_app", "online_only"):  # online_only becomes a flag
+                texts.append(part if len(part) <= 100 else part[:97] + "...")
+        desc = (deal.get("description") or "").strip()
+        if desc:
+            if re.search(r"\d+[.,]\d{2}\s*€\s*bonus", desc, re.I):
+                bonus = desc
+            else:
+                kind = classify_condition(desc)
+                if kind in ("loyalty", "online_only", "points", "no_app"):
+                    kinds.add(kind)
+                    if kind not in ("no_app", "online_only"):
+                        texts.append(desc)
+                elif kind != "noise":
+                    notes.append(desc)
         if not low:
-            # Deals without a price ("2 für 1", "-30 %") only carry a description.
-            notes.extend(x for x in [note, *conds] if x)
-        elif kind in ("REGULAR_PRICE", "RECOMMENDED_RETAIL_PRICE"):
-            reference["uvp" if kind == "RECOMMENDED_RETAIL_PRICE" else "regular_price"] = low
-        elif conds:
-            conditional.append(entry)
-        else:
-            plain.append(entry)
-    head = min(plain, key=lambda e: e.get("price") or 1e9) if plain else None
-    if head is None and conditional:
-        head = min(conditional, key=lambda e: e.get("price") or 1e9)
-        conditional = [c for c in conditional if c is not head]
+            notes.extend(texts)  # deals without a price: "2 für 1", "-30 %"
+            continue
+        if typ in ("REGULAR_PRICE", "RECOMMENDED_RETAIL_PRICE"):
+            reference["uvp" if typ == "RECOMMENDED_RETAIL_PRICE" else "regular_price"] = low
+            continue
+        online.append("online_only" in kinds)
+        entry = {"price": low, "price_max": high if high and high != low else None,
+                 "unit_price": (deal.get("priceByBaseUnit") or "").strip("() ") or None,
+                 "conditions": list(dict.fromkeys(texts))}
+        bucket = ("points" if "points" in kinds else "loyalty" if "loyalty" in kinds
+                  else "multi_buy" if "multi_buy" in kinds else "plain")
+        buckets[bucket].append(entry)
+
+    def cheapest(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+        return min(entries, key=lambda e: e["price"]) if entries else None
+
     out: dict[str, Any] = {}
+    head = cheapest(buckets["plain"])
+    if head is None and buckets["multi_buy"]:
+        head = cheapest(buckets["multi_buy"])
+        buckets["multi_buy"].remove(head)
+    loyalty_texts = [c for e in buckets["loyalty"] + buckets["points"] for c in e["conditions"]]
+    program = loyalty_program(retailer, loyalty_texts) if loyalty_texts or bonus else None
     if head:
-        out["price"] = head.get("price")
-        out["price_text"] = ("ab " if head.get("price_max") else "") + (fmt_eur(head.get("price")) or "")
-        out["unit_price"] = head.get("unit_price")
-        out["conditions"] = head.get("conditions")
-        if head.get("note"):
-            notes.insert(0, head["note"])
+        out["price"] = head["price"]
+        out["price_text"] = ("ab " if head["price_max"] else "") + (fmt_eur(head["price"]) or "")
+        out["unit_price"] = head["unit_price"]
+        out["conditions"] = head["conditions"]
+    elif buckets["loyalty"] or buckets["points"]:
+        out["app_only"] = True
+        if reference.get("regular_price"):
+            out["price"] = reference["regular_price"]
+            out["price_text"] = f"{fmt_eur(reference['regular_price'])} (ohne App, Normalpreis)"
+        else:
+            source = cheapest(buckets["loyalty"]) or cheapest(buckets["points"])
+            out["unit_price"] = source["unit_price"] if source else None
+    app = cheapest(buckets["loyalty"])
+    if app:
+        out["app_price"] = compact({"price": app["price"], "program": program, "conditions": app["conditions"],
+                                    "unit_price": app["unit_price"]})
+    points = cheapest(buckets["points"])
+    if points:
+        out["points_price"] = compact({"price": points["price"], "program": program,
+                                       "conditions": points["conditions"]})
+    if buckets["multi_buy"]:
+        out["multi_buy"] = [compact({"price": e["price"], "conditions": e["conditions"], "unit_price": e["unit_price"]})
+                            for e in buckets["multi_buy"]]
+    if online and all(online):
+        out["online_only"] = True
+    if bonus:
+        out["app_bonus"] = f"{bonus} (Guthaben mit {program}, kein Sofortrabatt)"
     if notes:
         out["price_note"] = "; ".join(dict.fromkeys(notes))
-    if conditional:
-        out["conditional_prices"] = [
-            compact({"price": c.get("price"), "conditions": c.get("conditions"), "unit_price": c.get("unit_price")})
-            for c in conditional
-        ]
     out.update(reference)
+    # unit_price_value belongs to `price`, or to the app price when only that is known.
     unit = parse_unit_price(out.get("unit_price"))
     if unit:
         out["unit_price_value"] = {"per": unit[0], "eur": unit[1]}
@@ -480,14 +648,16 @@ def offer_from_viewer(content: dict[str, Any], *, retailer: str | None = None,
         v = profiles[0].get("validity") or {}
         validity = Validity.from_strings(v.get("startDate"), v.get("endDate"))
     publisher = content.get("publisher") or {}
+    retailer = publisher.get("name") or retailer
     paths = [p.get("categoryPaths") or [] for p in products]
     out = {
         "offer_id": content.get("id"),
         "product": product.get("name"),
         "brand": product.get("brandName"),
         "description": description or None,
-        "retailer": publisher.get("name") or retailer,
-        **deals_summary(content.get("deals") or []),
+        "retailer": retailer,
+        **deals_summary(content.get("deals") or [], retailer),
+        "app_note": product_app_note(retailer, product.get("name"), description),
         **validity.describe(now),
         "brochure_id": bid,
         "page": page,
@@ -537,10 +707,20 @@ def relevance_tier(offer: dict[str, Any], query: str) -> int:
     return 4 if full else 5 if partial else 6
 
 
+def effective_price(offer: dict[str, Any]) -> float | None:
+    """Price used for ranking: your_price if personalized, else the store price for everyone."""
+    return offer.get("your_price", offer.get("price"))
+
+
+def effective_unit(offer: dict[str, Any]) -> float | None:
+    unit = offer.get("your_unit_price") or offer.get("unit_price_value") or {}
+    return unit.get("eur")
+
+
 def sort_key_price(offer: dict[str, Any]) -> tuple[float, float]:
-    return (offer.get("price") or 1e9, (offer.get("unit_price_value") or {}).get("eur") or 1e9)
+    return (effective_price(offer) or 1e9, effective_unit(offer) or 1e9)
 
 
 def sort_key_unit(offer: dict[str, Any]) -> tuple[float, float]:
-    unit = (offer.get("unit_price_value") or {}).get("eur")
-    return (unit if unit is not None else 1e9, offer.get("price") or 1e9)
+    unit = effective_unit(offer)
+    return (unit if unit is not None else 1e9, effective_price(offer) or 1e9)

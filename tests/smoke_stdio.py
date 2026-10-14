@@ -32,10 +32,10 @@ async def main():
             data = json.loads(text)
             print("search_offers:", err, data["recognized_category"], data["total_offers"])
             for o in data["offers"]:
-                print("   ", o["retailer"], "|", o.get("brand"), o["product"], "|", o.get("price_text"), o.get("conditions"), o.get("conditional_prices"), "|", o["validity"], "|", o["status"])
+                print("   ", o["retailer"], "|", o.get("brand"), o["product"], "|", o.get("price_text"), o.get("conditions"), o.get("app_price"), "|", o["validity"], "|", o["status"])
             netto = json.loads((await call("search_offers", query="Butter", stores=["Netto mit dem Scottie"]))[2])
             for o in netto["offers"][:3]:
-                print("   Scottie:", o.get("brand"), o["product"], o.get("price_text"), "| app:", o.get("conditional_prices"))
+                print("   Scottie:", o.get("brand"), o["product"], o.get("price_text"), "| app:", o.get("app_price"))
             milch = json.loads((await call("search_offers", query="Milch", max_results=2))[2])
             print("Milch category:", milch["recognized_category"])
             o = data["offers"][0]

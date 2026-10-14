@@ -42,15 +42,66 @@ def test_store_matching():
     assert N.store_matches("DE-1013", "Lidl", "DE-1013") and not N.store_matches("Lidl", "Penny")
 
 
-def test_deals_app_price_is_conditional():
-    deals = [
-        {"type": "SPECIAL_PRICE", "conditions": [{"other": "App-Preis"}], "min": 0.99, "max": 0.99, "priceByBaseUnit": " 1kg = 3.96"},
-        {"type": "SALES_PRICE", "conditions": [], "min": 1.19, "max": 1.19, "priceByBaseUnit": ""},
-        {"type": "OTHER", "conditions": [], "min": 0, "max": 0, "description": "2 für 1"},
-    ]
-    out = N.deals_summary(deals)
-    assert out["price"] == 1.19 and out["conditional_prices"][0] == {"price": 0.99, "conditions": ["App-Preis"], "unit_price": "1kg = 3.96"}
-    assert out["price_note"] == "2 für 1"
+def _deal(typ, price, *conds, desc=""):
+    return {"type": typ, "min": price, "max": price, "priceByBaseUnit": "",
+            "conditions": [{"other": c} for c in conds], "description": desc}
+
+
+def test_condition_classes():
+    expected = {
+        "Je": "noise", "je Packg.": "noise", "Kiste je": "noise", "Stück/Packung": "noise", "Auch online": "noise",
+        "Ohne PENNY App": "no_app", "Preis ohne Treuepunkte": "no_app", "Normalpreis": "no_app",
+        "Nur mit der App": "loyalty", "APP-PREIS": "loyalty", "MARKTKAUF-APP-PREIS": "loyalty",
+        "Mit Lidl Plus": "loyalty", "Netto plus": "loyalty", "XTRA": "loyalty", "Nur mit der REWE App": "loyalty",
+        "mit 55 Treuepunkten": "points", "Nur online": "online_only", "ab 4 Dosen": "multi_buy", "2 für": "multi_buy", "4 KAUFEN": "multi_buy",
+        "An unserer Theke": "other",
+    }
+    for text, kind in expected.items():
+        assert N.classify_condition(text) == kind, (text, N.classify_condition(text))
+
+
+def test_netto_app_price_is_not_the_main_price():
+    out = N.deals_summary([_deal("SPECIAL_PRICE", 0.99, "App-Preis"), _deal("SALES_PRICE", 1.19)],
+                          "Netto mit dem Scottie")
+    assert out["price"] == 1.19 and out["app_price"]["price"] == 0.99 and out["app_price"]["program"] == "Netto App"
+
+
+def test_penny_marks_both_prices():
+    out = N.deals_summary([_deal("SALES_PRICE", 1.99, "Ohne PENNY App"), _deal("SPECIAL_PRICE", 1.49, "Nur mit App")],
+                          "Penny")
+    assert out["price"] == 1.99 and "conditions" not in out
+    assert out["app_price"] == {"price": 1.49, "program": "PENNY App", "conditions": ["Nur mit App"]}
+
+
+def test_app_only_falls_back_to_normal_price():
+    out = N.deals_summary([_deal("SALES_PRICE", 1.99, "Mit Lidl Plus"), _deal("REGULAR_PRICE", 3.49)], "Lidl")
+    assert out["app_only"] and out["price"] == 3.49 and out["app_price"]["price"] == 1.99
+
+
+def test_kaufland_je_is_no_condition():
+    out = N.deals_summary([_deal("SALES_PRICE", 2.22, "Je")], "Kaufland")
+    assert out == {"price": 2.22, "price_text": "2,22 €"}
+
+
+def test_points_bonus_online_multibuy():
+    assert N.deals_summary([_deal("SALES_PRICE", 2.99, "mit 55 Treuepunkten"), _deal("SALES_PRICE", 4.99)],
+                           "Penny")["points_price"]["price"] == 2.99
+    assert "Bonus" in N.deals_summary([_deal("SALES_PRICE", 1.29, desc="0,10 € Bonus")], "REWE")["app_bonus"]
+    assert N.deals_summary([_deal("SALES_PRICE", 99.0, "Nur online")], "Lidl")["online_only"] is True
+    multi = N.deals_summary([_deal("SALES_PRICE", 0.79, "Je", "ab 4 Dosen"), _deal("SALES_PRICE", 0.99)], "Netto")
+    assert multi["price"] == 0.99 and multi["multi_buy"][0]["price"] == 0.79
+
+
+def test_your_price_depends_on_apps():
+    offer = {"retailer": "Penny", "price": 1.99, "app_price": {"price": 1.49, "program": "PENNY App"},
+             "unit_price_value": {"per": "kg", "eur": 7.96}}
+    assert N.personalize(dict(offer), [])["your_price"] == 1.99
+    mine = N.personalize(dict(offer), ["Penny"])
+    assert mine["your_price"] == 1.49 and mine["your_price_basis"] == "mit PENNY App"
+    assert mine["your_unit_price"] == {"per": "kg", "eur": 5.96}
+    assert N.has_app(["Lidl Plus"], "Lidl", "Lidl Plus") and N.has_app(["alle"], "REWE", "REWE App")
+    assert N.has_app(["PAYBACK"], "Netto Marken-Discount", "PAYBACK")
+    assert not N.has_app(["Lidl Plus"], "Penny", "PENNY App") and not N.has_app(["App"], "Penny", "PENNY App")
 
 
 def test_quantity():
