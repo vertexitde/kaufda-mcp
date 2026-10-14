@@ -115,11 +115,31 @@ def test_quantity():
     assert o["unit_price_value"] == {"per": "l", "eur": 0.99, "estimated": True}
 
 
+def test_shopping_list_helpers():
+    assert N.user_spec_part("2 l · bei Netto: Weihenstephan H-Milch 0,99 € bis Sa 17.10.") == "2 l"
+    assert N.user_spec_part("bei Lidl: Milbona Butter 1,79 €") == "" and N.user_spec_part("fettarm") == "fettarm"
+    pack = {"description": "1 l", "product": "H-Milch"}
+    assert N.desired_count("2 l", pack) == 2 and N.desired_count("3", pack) == 3 and N.desired_count("2 Flaschen", pack) == 2
+    assert N.desired_count("1,5 l", pack) == 2 and N.desired_count("fettarm", pack) == 1 and N.desired_count("", pack) == 1
+    assert N.desired_count("500 g", {"description": "250 g"}) == 2
+    assert N.packs_needed(("kg", 0.25), {"description": "225 g"}, exact=False) == 1
+    assert N.packs_needed(("kg", 0.25), {"description": "225 g"}) == 2
+    assert N.packs_needed(("l", 1.0), {"price": 8.0, "unit_price_value": {"per": "l", "eur": 0.67}}, exact=False) == 1
+    assert N.typical_need([{"description": "1 l"}, {"description": "1 l"}, {"description": "6 x 1 l"}]) == ("l", 1.0)
+    assert N.generic_queries("Trinken")[0] == "Mineralwasser" and N.generic_queries("Süßes") and not N.generic_queries("Milch")
+    offer = N.personalize({"retailer": "Lidl", "price": 0.75, "regular_price": 1.59}, [])
+    assert offer["discount_pct"] == 53
+
+
 def test_relevance_tier():
     assert N.relevance_tier({"product": "Fettarme H-Milch", "category_match": True}, "Milch") == 0
     assert N.relevance_tier({"product": "Kondensmilch", "category_match": True}, "Milch") == 1
     assert N.relevance_tier({"product": "Kakao zum Backen", "category_match": True}, "Milch") == 3
     assert N.relevance_tier({"product": "Butterkekse", "category_match": False}, "Butter") == 4
+    assert N.relevance_tier({"product": "Rama mit Butter", "category_match": True}, "Butter") == 1
+    assert N.relevance_tier({"product": "Butter-Mandel-Stollen", "category_match": True}, "Butter") == 1
+    assert N.relevance_tier({"product": "Schweine-Hackfleisch", "category_match": True}, "Hackfleisch") == 0
+    assert N.relevance_tier({"product": "Feine Butter/Streichzart", "category_match": True}, "Butter") == 0
 
 
 if __name__ == "__main__":

@@ -15,7 +15,6 @@ import os
 import secrets
 import threading
 import time
-import uuid as uuidlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import parse_qs
@@ -35,6 +34,9 @@ BRING_HEADERS = {
     "X-BRING-COUNTRY": "DE",
 }
 CATALOG_LOCALE = "de-CH"  # Bring! stores catalog items under their de-CH name
+# Per item flags of the Bring! apps: Dringend, Wenn's passt (bei Gelegenheit), Im Angebot.
+FLAG_KEYS = ("urgent", "convenient", "discounted")
+DEFAULT_ATTRIBUTE_TYPE = "PURCH_CONDITIONS"  # best guess, replaced by the type seen on the user's own items
 KEYRING_SERVICE = "kaufda-mcp"
 KEYRING_ACCOUNT = "bring-session"
 
@@ -152,6 +154,8 @@ class BringClient:
         self._lock = asyncio.Lock()
         self._catalog: dict[str, dict[str, str]] = {}
         self._list_locales: dict[str, str] | None = None
+        self.attribute_type = DEFAULT_ATTRIBUTE_TYPE
+        self.attribute_type_verified = False
 
     # ------------------------------------------------------------ session handling
 
@@ -238,7 +242,12 @@ class BringClient:
                 continue
             if resp.status_code >= 400:
                 raise BringError(f"Bring! Anfrage fehlgeschlagen (HTTP {resp.status_code}).")
-            return resp.json() if resp.content else None
+            if not resp.content:
+                return None
+            try:
+                return resp.json()
+            except ValueError:
+                return resp.text
         raise BringAuthError("Bring! Anmeldung ungültig. Bitte neu verbinden (bring_connect).")
 
     # ------------------------------------------------------------ catalog (item names <-> Bring! ids)
@@ -290,38 +299,111 @@ class BringClient:
         return [{"uuid": entry["listUuid"], "name": entry.get("name") or "Liste"}
                 for entry in (data or {}).get("lists") or [] if entry.get("listUuid")]
 
-    async def items(self, list_uuid: str) -> dict[str, list[dict[str, str]]]:
+    def _learn_attribute_type(self, item: dict[str, Any]) -> dict[str, bool]:
+        """Read the per item flags. The attribute's type name is not documented, so it is learned from items
+        the user marked in the app (anything carrying urgent/convenient/discounted that is not an offer)."""
+        flags = {key: False for key in FLAG_KEYS}
+        for attr in item.get("attributes") or []:
+            content = attr.get("content") or {}
+            if not any(key in content for key in FLAG_KEYS):
+                continue
+            for key in FLAG_KEYS:
+                flags[key] = flags[key] or bool(content.get(key))
+            if attr.get("type") and attr["type"] != "RETAIL_PRODUCT" and any(content.get(k) for k in FLAG_KEYS):
+                self.attribute_type = attr["type"]
+                self.attribute_type_verified = True
+        return flags
+
+    async def items(self, list_uuid: str) -> dict[str, list[dict[str, Any]]]:
         data = await self._request("GET", f"/v2/bringlists/{list_uuid}")
         raw = (data or {}).get("items") or {}
-        out: dict[str, list[dict[str, str]]] = {}
+        out: dict[str, list[dict[str, Any]]] = {}
         for section in ("purchase", "recently"):
-            out[section] = [
-                N.compact({"name": await self._to_name(item.get("itemId", ""), list_uuid),
-                           "specification": item.get("specification"), "uuid": item.get("uuid")})
-                for item in raw.get(section) or []
-            ]
+            entries = []
+            for item in raw.get(section) or []:
+                flags = self._learn_attribute_type(item)
+                entries.append(N.compact({
+                    "name": await self._to_name(item.get("itemId", ""), list_uuid),
+                    "specification": item.get("specification"),
+                    "uuid": item.get("uuid"),
+                    "item_id": item.get("itemId"),
+                    **{key: True for key, on in flags.items() if on},
+                }))
+            out[section] = entries
         return out
 
-    async def change(self, list_uuid: str, items: list[dict[str, str | None]], operation: str) -> list[str]:
-        """operation: TO_PURCHASE (add/update), TO_RECENTLY (done), REMOVE."""
-        current = {N.norm(i["name"]): i for i in (await self.items(list_uuid))["purchase"]}
-        changes, names = [], []
+    async def _legacy(self, list_uuid: str, **fields: str) -> None:
+        """Name addressed list change. Measured by other Bring! clients: the newer items endpoint silently
+        ignores REMOVE/TO_RECENTLY for many items, this form endpoint applies them reliably."""
+        form = {"purchase": "", "recently": "", "specification": "", "remove": "", "sender": "null", **fields}
+        await self._request("PUT", f"/v2/bringlists/{list_uuid}", data=form)
+
+    async def _set_flags(self, list_uuid: str, item: dict[str, Any], flags: dict[str, bool]) -> None:
+        change = {
+            "accuracy": "0.0", "altitude": "0.0", "latitude": "0.0", "longitude": "0.0",
+            "itemId": item["item_id"], "spec": item.get("specification") or "", "uuid": item["uuid"],
+            "operation": "ATTRIBUTE_UPDATE",
+            "attribute": {"type": self.attribute_type, "content": flags},
+        }
+        await self._request("PUT", f"/v2/bringlists/{list_uuid}/items", json={"changes": [change], "sender": ""})
+
+    async def change(self, list_uuid: str, items: list[dict[str, Any]], operation: str) -> list[dict[str, Any]]:
+        """operation: TO_PURCHASE (add/update), TO_RECENTLY (bought), REMOVE.
+
+        specification: None keeps the existing text, "" clears it. Flags (urgent, convenient, discounted):
+        None keeps them. Returns one result per item, flags are read back to verify they really stuck."""
+        before = await self.items(list_uuid)
+        current = {N.norm(i["name"]): i for i in before["purchase"]}
+        results: list[dict[str, Any]] = []
+        flag_jobs: list[tuple[str, dict[str, bool]]] = []
         for item in items:
             name = (item.get("name") or "").strip()
             if not name:
                 continue
-            existing = current.get(N.norm(name)) or {}
-            changes.append({
-                "accuracy": "0.0", "altitude": "0.0", "latitude": "0.0", "longitude": "0.0",
-                "itemId": await self._to_bring_id(name, list_uuid),
-                "spec": (item.get("specification") or "")[:120],
-                "uuid": existing.get("uuid") or str(uuidlib.uuid4()),
-                "operation": operation,
-            })
-            names.append(name)
-        if changes:
-            await self._request("PUT", f"/v2/bringlists/{list_uuid}/items", json={"changes": changes, "sender": ""})
-        return names
+            key = await self._to_bring_id(name, list_uuid)
+            existing = current.get(N.norm(name))
+            if operation == "REMOVE":
+                if not existing:
+                    results.append({"name": name, "result": "stand nicht auf der Liste"})
+                    continue
+                await self._legacy(list_uuid, remove=existing.get("item_id") or key)
+                results.append({"name": name, "result": "entfernt"})
+            elif operation == "TO_RECENTLY":
+                if not existing:
+                    results.append({"name": name, "result": "stand nicht auf der Liste"})
+                    continue
+                await self._legacy(list_uuid, recently=existing.get("item_id") or key)
+                results.append({"name": name, "result": "als gekauft abgehakt"})
+            else:
+                spec = item.get("specification")
+                if spec is None:
+                    spec = (existing or {}).get("specification") or ""
+                await self._legacy(list_uuid, purchase=(existing or {}).get("item_id") or key, specification=spec[:250])
+                results.append(N.compact({"name": name, "result": "aktualisiert" if existing else "hinzugefügt",
+                                          "specification": spec}))
+                wanted = {k: item[k] for k in FLAG_KEYS if item.get(k) is not None}
+                if wanted:
+                    merged = {k: bool((existing or {}).get(k)) for k in FLAG_KEYS} | wanted
+                    flag_jobs.append((name, merged))
+        if flag_jobs:
+            after = {N.norm(i["name"]): i for i in (await self.items(list_uuid))["purchase"]}
+            for name, flags in flag_jobs:
+                target = after.get(N.norm(name))
+                if target and target.get("uuid"):
+                    try:
+                        await self._set_flags(list_uuid, target, flags)
+                    except BringError as exc:
+                        log.warning("bring flags %s: %s", name, exc)
+            check = {N.norm(i["name"]): i for i in (await self.items(list_uuid))["purchase"]}
+            by_name = {N.norm(r["name"]): r for r in results}
+            for name, flags in flag_jobs:
+                got = check.get(N.norm(name)) or {}
+                ok = all(bool(got.get(k)) == v for k, v in flags.items())
+                by_name[N.norm(name)]["flags"] = {k: v for k, v in flags.items() if v} or "keine"
+                by_name[N.norm(name)]["flags_saved"] = ok
+                if ok:
+                    self.attribute_type_verified = True
+        return results
 
 
 # ---------------------------------------------------------------- local login page

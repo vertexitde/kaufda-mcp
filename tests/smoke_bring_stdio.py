@@ -33,8 +33,8 @@ async def main():
             err, text = await call("bring_add_items", items=[{"name": "Butter"}])
             print("bring_add_items ohne Login -> isError", err, "|", text[:110])
             sl = json.loads((await call("shopping_list", items=["Butter", "Eier", "Grillkohle"], alternatives=0))[1])
-            print("bring_items aus shopping_list:")
-            for it in sl["bring_items"]:
+            print("bring_updates aus shopping_list:")
+            for it in sl["bring_updates"]:
                 print("   ", it)
 
 asyncio.run(main())

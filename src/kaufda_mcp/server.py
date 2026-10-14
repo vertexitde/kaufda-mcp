@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import itertools
 import json
 import logging
 import os
 import sys
 from collections import Counter
-from datetime import date
+from datetime import date, timedelta
 from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -35,7 +36,12 @@ set_preferences(location=...). Also store the shops the user likes (set_preferen
 searches are then limited to those shops by default (only_favorites=true). Ask once which retailer apps / \
 loyalty cards the user uses (Lidl Plus, PENNY App, Kaufland Card, REWE App, EDEKA App, Netto App, PAYBACK, \
 ...) and save them with set_preferences(apps=[...]).
-2. search_offers for single products, shopping_list for several items at once.
+2. search_offers for single products. shopping_list makes a shopping PLAN for a whole list: it compares the \
+best mix over all stores with the best 1, 2 and 3 store plans and recommends one (recommended.why). Present \
+the recommendation, the other_plans (e.g. "nur Lidl: 2 € teurer, aber nur ein Laden") and alternatives, let the \
+user decide items under `choose` (umbrella terms like "Trinken" or "Snacks" were searched broadly: suggest the \
+best real deals by discount_pct; unsure matches), then ask before changing anything. If the user wants a \
+different plan, call shopping_list again with stores=<that plan's stores>.
 3. Validity is evaluated per offer against the current date ("today" in every answer): many offers \
 start mid-week (e.g. Thursday) and next week's brochures are often already online. Every offer has \
 valid_from/valid_until, valid_today and a status like "aktiv", "aktiv, endet heute", \
@@ -61,15 +67,20 @@ often only loosely related (e.g. "Butterkekse" for "Butter").
 6. Shopping list apps: ask once whether the user keeps a shopping list in an app (supported: Bring!) and save \
 it with set_preferences(shopping_list_app="bring"). Then call bring_connect and give the user the login_url: \
 they log in there themselves. NEVER ask for the Bring! password in chat. Afterwards bring_status lists their \
-lists; if there are several, ask which one and call bring_select_list. shopping_list then returns bring_items \
-(name + specification with store, price and validity); after the user agrees with the plan, add them with \
-bring_add_items.
+lists; if there are several, ask which one and call bring_select_list. "Schau dir meine Einkaufsliste an und \
+mach einen Plan" = shopping_list(from_bring_list=true): the user's notes (e.g. "2 l") count as quantity, \
+items marked urgent only get offers valid today. shopping_list returns bring_updates for the recommended plan: \
+short title ("Milch"), Beschreibung/Menge = the user's note + " · bei <Markt>: <Produkt> <Preis> <ab/bis>", \
+flag discounted=true. After the user agrees, pass them to bring_add_items. Keep titles short; product names, \
+brands and stores belong in the specification. Flags: urgent (Dringend), convenient (Wenn's passt), \
+discounted (Im Angebot).
 """
 
 mcp = FastMCP("kaufda", instructions=INSTRUCTIONS, log_level=os.environ.get("KAUFDA_MCP_LOGLEVEL", "WARNING").upper())
 client = KaufdaClient()
 prefs = PreferenceStore()
 bring = BringClient()
+bring.attribute_type = prefs.load().get("bring_attribute_type") or bring.attribute_type
 
 
 def _bring_logged_in(session: dict[str, Any]) -> None:
@@ -232,7 +243,13 @@ async def _search(query: str, loc: dict[str, Any], *, wanted: list[str], when: s
                 for key in N.PRICE_KEYS:
                     offer.pop(key, None)
                 offer.update(deals)
-                N.estimate_unit_price(offer)
+            if not offer.get("description"):
+                # The brochure text carries the pack size ("je 1-l-Packung") the search index leaves out.
+                text = "; ".join(p.get("paragraph", "").strip() for prod in (detail.get("products") or [])[:1]
+                                 for p in prod.get("description") or [] if p.get("paragraph"))
+                if text:
+                    offer["description"] = text[:200]
+            N.estimate_unit_price(offer)
         if not validity.matches(when, valid_on, now):
             hidden_time += 1
             continue
@@ -423,13 +440,6 @@ async def search_offers(
     }))
 
 
-_SLIM_KEYS = ("offer_id", "product", "brand", "description", "retailer", "your_price", "your_price_basis",
-              "your_price_note", "price", "price_text", "unit_price", "unit_price_value", "conditions", "app_price",
-              "app_only", "points_price", "multi_buy", "online_only", "app_bonus", "app_note", "regular_price", "uvp",
-              "validity", "status", "valid_today", "starts_in_days", "valid_from", "valid_until", "brochure_id",
-              "page", "viewer_url", "cutout_url", "distance_km")
-
-
 def _price_line(offer: dict[str, Any]) -> dict[str, Any]:
     """Short price info for the per-store overview: what the user pays plus the app hint if they lack it."""
     your = N.effective_price(offer)
@@ -448,26 +458,43 @@ def _price_line(offer: dict[str, Any]) -> dict[str, Any]:
                       "app_note": offer.get("app_note"), "online_only": offer.get("online_only")})
 
 
-def _slim(offer: dict[str, Any]) -> dict[str, Any]:
-    return {k: offer[k] for k in _SLIM_KEYS if k in offer}
-
-
-def _bring_spec(offer: dict[str, Any]) -> str:
-    """Short note for the shopping list app: 'Meggle, Netto 0,99 €, bis Sa 17.10.'"""
-    price = _price_line(offer).get("price_text") or ""
-    if offer.get("valid_from") and not offer.get("valid_today"):
-        when = "ab " + N.fmt_day(date.fromisoformat(offer["valid_from"]))
-    elif offer.get("valid_until"):
-        when = "bis " + N.fmt_day(date.fromisoformat(offer["valid_until"]))
-    else:
-        when = ""
-    retailer = _SHORT_RETAILER.get(offer.get("retailer") or "", offer.get("retailer"))
-    parts = [offer.get("brand"), " ".join(x for x in (retailer, price) if x), when]
-    return ", ".join(p for p in parts if p)[:120]
-
-
 _SHORT_RETAILER = {"Netto Marken-Discount": "Netto", "Netto mit dem Scottie": "Netto Scottie",
                    "dm-drogerie markt": "dm", "famila Nordost": "famila", "MediaMarkt Saturn": "MediaMarkt"}
+
+
+def _short(retailer: str | None) -> str:
+    return _SHORT_RETAILER.get(retailer or "", retailer or "?")
+
+
+def _when_text(offer: dict[str, Any]) -> str:
+    if offer.get("valid_from") and not offer.get("valid_today"):
+        return "ab " + N.fmt_day(date.fromisoformat(offer["valid_from"]))
+    if offer.get("valid_until"):
+        return "bis " + N.fmt_day(date.fromisoformat(offer["valid_until"]))
+    return ""
+
+
+def _bring_spec(offer: dict[str, Any], user_note: str = "", count: int = 1) -> str:
+    """'2 l · bei Netto: Weihenstephan H-Milch 2 × 0,99 € bis Sa 17.10.' The part from 'bei' on is replaced
+    on the next plan, the user's own note (Menge, Sorte) stays."""
+    product = " ".join(x for x in (offer.get("brand"), offer.get("product")) if x)
+    price = _price_line(offer).get("price_text") or ""
+    if count > 1 and price:
+        price = f"{count} × {price}"
+    store = f"bei {_short(offer.get('retailer'))}: " + " ".join(x for x in (product, price, _when_text(offer)) if x)
+    return (f"{user_note} · {store}" if user_note else store)[:250]
+
+
+def _compact_offer(offer: dict[str, Any]) -> dict[str, Any]:
+    return N.compact({
+        "product": " ".join(x for x in (offer.get("brand"), offer.get("product")) if x),
+        "retailer": _short(offer.get("retailer")),
+        **_price_line(offer),
+        "discount_pct": offer.get("discount_pct"),
+        "status": offer.get("status"),
+        "offer_id": offer.get("offer_id"),
+        "brochure_id": offer.get("brochure_id"),
+    })
 
 
 def _store_plan(picks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -507,81 +534,287 @@ def _rank(offers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(offers, key=N.sort_key_price)
 
 
+async def _item_candidates(entry: dict[str, Any], loc: dict[str, Any], search_kw: dict[str, Any],
+                           horizon: str | None = None) -> None:
+    """Fill entry['offers'] with the acceptable offers for one shopping list line, best first.
+    horizon (ISO date): ignore offers that only start after it (e.g. next week's brochure)."""
+
+    def in_horizon(o: dict[str, Any]) -> bool:
+        return not horizon or not o.get("valid_from") or o["valid_from"] <= horizon
+
+    item = entry["item"]
+    queries = N.generic_queries(item)
+    if queries:
+        # Umbrella term ("Trinken"): look broadly and rank by how good the deal is.
+        results = await asyncio.gather(*(_search(q, loc, **search_kw) for q in queries), return_exceptions=True)
+        offers, seen = [], set()
+        for query, res in zip(queries, results):
+            if isinstance(res, BaseException):
+                continue
+            for o in res["offers"]:
+                key = (o.get("retailer"), o.get("product"), o.get("price"))
+                if o.get("online_only") or key in seen or N.relevance_tier(o, query) > 2 or not in_horizon(o):
+                    continue
+                seen.add(key)
+                offers.append(o)
+        offers.sort(key=lambda o: (-(o.get("discount_pct") or 0), N.effective_price(o) or 1e9))
+        entry.update(offers=offers, flexible=True, queries=queries, tier=0)
+        return
+    res = await _search(item, loc, **search_kw)
+    offers = [o for o in res["offers"] if in_horizon(o)]
+    offers = [o for o in offers if not o.get("online_only")] or offers
+    tiers: dict[int, list[dict[str, Any]]] = {}
+    for o in offers:
+        tiers.setdefault(N.relevance_tier(o, item), []).append(o)
+    if not tiers:
+        entry.update(offers=[])
+        return
+    best_tier = min(tiers)
+    candidates = tiers[best_tier]
+    usual = N.typical_need(candidates)
+    user_need = N.parse_need(entry.get("note"))
+    need = user_need or usual
+    entry.update(need=need, usual_pack=usual if isinstance(usual, tuple) else None, need_exact=user_need is not None)
+    # Cheapest for the amount actually needed; Grundpreis only breaks ties (no 12er Kiste for 2 l).
+    order = {id(o): i for i, o in enumerate(_rank(candidates))}
+    ranked = sorted(candidates, key=lambda o: (
+        round((N.effective_price(o) or 1e9) * N.packs_needed(need, o, entry["usual_pack"], entry["need_exact"]), 2), order[id(o)]))
+    if entry.get("urgent"):
+        today = [o for o in ranked if o.get("valid_today")]
+        if today and len(today) < len(ranked):
+            ranked = today
+            entry["remark"] = "dringend: nur Angebote, die heute schon gelten"
+    entry.update(offers=ranked, tier=best_tier, flexible=best_tier >= 3)
+
+
+def _evaluate(entries: list[dict[str, Any]], stores: frozenset[str] | None) -> dict[str, Any]:
+    """Pick per item the best offer within `stores` (cheapest for the needed amount). 'extra' = how much more
+    than the overall best offers (only firm items; umbrella terms just get the best deal in these stores)."""
+    picks: dict[str, tuple[dict[str, Any], int, float]] = {}
+    extra, covered, savings = 0.0, 0, 0.0
+
+    def take(entry: dict[str, Any], o: dict[str, Any]) -> None:
+        nonlocal extra, covered, savings
+        need, usual = entry.get("need"), entry.get("usual_pack")
+        exact = entry.get("need_exact", True)
+        count = N.packs_needed(need, o, usual, exact)
+        picks[entry["item"]] = (o, count, (N.effective_price(o) or 0.0) * count)
+        if not entry.get("flexible"):
+            covered += 1
+            ref = entry["offers"][0]
+            extra += max(0.0, picks[entry["item"]][2]
+                         - (N.effective_price(ref) or 0.0) * N.packs_needed(need, ref, usual, exact))
+        regular, eff = o.get("regular_price") or o.get("uvp"), N.effective_price(o)
+        if regular and eff and regular > eff:
+            savings += (regular - eff) * count
+
+    firm = [e for e in entries if not e.get("flexible")]
+    for entry in firm:
+        hit = next((o for o in entry["offers"] if stores is None or o.get("retailer") in stores), None)
+        if hit:
+            take(entry, hit)
+    # Umbrella terms ("Trinken") take the best deal in the stores the plan visits anyway.
+    visiting = stores if stores is not None else frozenset(o.get("retailer") for o, _, _ in picks.values())
+    for entry in entries:
+        if entry.get("flexible"):
+            hit = next((o for o in entry["offers"] if o.get("retailer") in visiting), None)
+            if hit is None and (stores is None or not firm):
+                hit = entry["offers"][0]
+            if hit:
+                take(entry, hit)
+    return {"stores": frozenset(o.get("retailer") for o, _, _ in picks.values()), "picks": picks,
+            "total": sum(cost for _, _, cost in picks.values()), "savings": savings, "extra": extra,
+            "covered": covered}
+
+
+def _plans(entries: list[dict[str, Any]], max_stores: int) -> list[tuple[str, dict[str, Any]]]:
+    """Best mix over all stores plus the best plan with 1, 2, ... stores (most firm items covered, then the
+    smallest extra cost for the same amounts)."""
+    usable = [e for e in entries if e["offers"]]
+    firm = [e for e in usable if not e.get("flexible")] or usable
+    ranking = Counter(o.get("retailer") for e in firm for o in e["offers"])
+    stores = [s for s, _ in ranking.most_common(12)]
+    plans = [("Bester Mix", _evaluate(usable, None))]
+    for k in range(1, min(max_stores, len(stores)) + 1):
+        best = None
+        for combo in itertools.combinations(stores, k):
+            ev = _evaluate(usable, frozenset(combo))
+            key = (-ev["covered"], round(ev["extra"], 2), round(ev["total"], 2))
+            if best is None or key < best[0]:
+                best = (key, ev)
+        if best:
+            plans.append((f"{k} {'Markt' if k == 1 else 'Märkte'}", best[1]))
+    unique, seen = [], set()
+    for label, ev in plans:
+        signature = tuple(sorted((item, id(o)) for item, (o, _, _) in ev["picks"].items()))
+        if signature not in seen:
+            seen.add(signature)
+            unique.append((label, ev))
+    return unique
+
+
+def _recommend(plans: list[tuple[str, dict[str, Any]]]) -> tuple[str, dict[str, Any], str]:
+    """Fewest stores that cover as much as the best mix and cost at most ~2 € (or 5 %) more for the same
+    amounts."""
+    mix = plans[0][1]
+    tolerance = max(2.0, 0.05 * mix["total"])
+    fitting = [(label, ev) for label, ev in plans if ev["covered"] == mix["covered"] and ev["extra"] <= tolerance]
+    label, ev = min(fitting, key=lambda p: (len(p[1]["stores"]), p[1]["extra"]))
+    if ev is mix:
+        return label, ev, "Günstigste Kombination für alle Artikel mit Angebot."
+    if ev["extra"] < 0.01:
+        cost = "genauso günstig wie der beste Mix"
+    else:
+        cost = f"bei gleichen Mengen nur ca. {N.fmt_eur(ev['extra'])} teurer als der beste Mix"
+    return label, ev, f"Nur {len(ev['stores'])} statt {len(mix['stores'])} Märkte, {cost}."
+
+
+def _plan_out(label: str, ev: dict[str, Any], entries: list[dict[str, Any]], detailed: bool) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "label": f"{label}: " + " + ".join(sorted(_short(s) for s in ev["stores"])),
+        "covered": f"{len(ev['picks'])}/{len(entries)}",
+        "total_eur": round(ev["total"], 2),
+        "extra_vs_best_mix_eur": round(ev["extra"], 2) or None,
+        "savings_eur": round(ev["savings"], 2) or None,
+        "not_on_offer_here": [e["item"] for e in entries if e["item"] not in ev["picks"]],
+    }
+    if not detailed:
+        out["items"] = {item: f"{_short(o.get('retailer'))} {_price_line(o).get('price_text') or ''}".strip()
+                        for item, (o, _, _) in ev["picks"].items()}
+        return N.compact(out)
+    by_store: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        if entry["item"] not in ev["picks"]:
+            continue
+        o, count, cost = ev["picks"][entry["item"]]
+        by_store.setdefault(o.get("retailer") or "?", []).append(N.compact({
+            "item": entry["item"],
+            "note": entry.get("note") or None,
+            "count": count if count > 1 else None,
+            "product": " ".join(x for x in (o.get("brand"), o.get("product")) if x),
+            **_price_line(o),
+            "cost_eur": round(cost, 2) if count > 1 else None,
+            "discount_pct": o.get("discount_pct"),
+            "validity": o.get("validity"), "status": o.get("status"), "page": o.get("page"),
+            "viewer_url": o.get("viewer_url"), "cutout_url": o.get("cutout_url"),
+            "remark": entry.get("remark"),
+            "_from": o.get("valid_from"), "_until": o.get("valid_until"),
+        }))
+    out["by_store"] = {store: _store_plan(picks) for store, picks in by_store.items()}
+    return N.compact(out)
+
+
 @mcp.tool()
 async def shopping_list(
-    items: Annotated[list[str], Field(min_length=1, max_length=40,
-                                      description="Products to buy, e.g. ['Butter', 'Eier', 'Hackfleisch'].")],
+    items: Annotated[list[str] | None, Field(
+        max_length=40, description="Short item names like on a shopping list: ['Milch', 'Butter', 'Trinken']. "
+                                   "Umbrella terms (Trinken, Snacks, Obst, Grillzeug ...) are searched broadly.")] = None,
+    from_bring_list: Annotated[bool, Field(
+        description="Use the items on the user's Bring! list (their notes like '2 l' count as quantity).")] = False,
+    bring_list: Annotated[str | None, Field(description="Other Bring! list than the selected one.")] = None,
     location: LocationArg = None,
     stores: StoresArg = None,
     only_favorites: FavArg = True,
     when: WhenArg = "all",
     valid_on: ValidOnArg = None,
     max_distance_km: RadiusArg = None,
+    max_stores: Annotated[int, Field(ge=1, le=4, description="Largest store count to compare plans for.")] = 3,
     alternatives: Annotated[int, Field(ge=0, le=5, description="Extra options per item.")] = 2,
 ) -> str:
-    """Find the best current/upcoming offer for every item of a shopping list and group the picks by store.
-    Ranked by the user's price (your_price: app/card prices only if the user has that app) per unit where
-    comparable, otherwise by price; category matches are preferred, online-only offers are avoided."""
+    """Make a shopping plan: finds the offers for every item (from `items` and/or the user's Bring! list),
+    then works out where the whole list is cheapest: best mix over all stores vs. the best plan with 1, 2, 3
+    stores, with a recommendation, alternatives, items the user should choose (umbrella terms, unsure matches)
+    and ready bring_updates. Prices are the user's prices (apps they use); quantities from notes count."""
     loc = await _location(location)
     wanted, scope = _store_filter(stores, only_favorites)
-    day = _valid_on(valid_on)
-    radius = _radius(max_distance_km)
-    apps = prefs.apps()
+    entries: list[dict[str, Any]] = []
+    sources: list[str] = []
+    if from_bring_list:
+        chosen = await _bring_list(bring_list)
+        try:
+            on_list = (await bring.items(chosen["uuid"]))["purchase"]
+        except BringError as exc:
+            raise ToolError(str(exc)) from exc
+        for b in on_list:
+            entries.append({"item": b["name"], "note": N.user_spec_part(b.get("specification")),
+                            "spec": b.get("specification") or "", "urgent": b.get("urgent"), "from_bring": True})
+        sources.append(f"Bring! Liste '{chosen['name']}' ({len(on_list)} Artikel)")
+    for name in items or []:
+        if name.strip() and not any(N.norm(name) == N.norm(e["item"]) for e in entries):
+            entries.append({"item": name.strip(), "note": "", "from_bring": False})
+    if not entries:
+        raise ToolError("Keine Artikel: items angeben oder from_bring_list=true nutzen (ist die Bring! Liste leer?).")
+    entries = entries[:40]
+    if items:
+        sources.append("Eingabe")
+    search_kw = dict(wanted=wanted, when=when, valid_on=_valid_on(valid_on), radius=_radius(max_distance_km),
+                     sort="relevance", exact_validity=True, apps=prefs.apps())
+    today = N.now_berlin().date()
+    horizon = None
+    if valid_on is None and when == "all":
+        # One shopping trip: this week up to Saturday (incl. offers starting Thursday), not next week's brochures.
+        horizon = today + timedelta(days=(5 - today.weekday()) % 7)
+        period = (f"diese Woche bis {N.fmt_day(horizon)} (Prospekte der nächsten Woche: when='upcoming' "
+                  "oder valid_on)")
+    elif valid_on:
+        period = f"Einkauf am {N.fmt_day(search_kw['valid_on'])}"
+    else:
+        period = {"now": "nur heute gültige Angebote", "upcoming": "nur kommende Angebote"}.get(when, when)
     results = await asyncio.gather(
-        *(_search(item, loc, wanted=wanted, when=when, valid_on=day, radius=radius, sort="relevance",
-                  exact_validity=True, apps=apps) for item in items),
+        *(_item_candidates(e, loc, search_kw, horizon.isoformat() if horizon else None) for e in entries),
         return_exceptions=True,
     )
-    per_item, by_store, missing = [], {}, []
-    total = 0.0
-    for item, res in zip(items, results):
+    for entry, res in zip(entries, results):
         if isinstance(res, BaseException):
-            per_item.append({"item": item, "error": str(res)})
-            continue
-        offers = [o for o in res["offers"] if not o.get("online_only")] or res["offers"]
-        if not offers:
-            missing.append(item)
-            per_item.append(N.compact({"item": item, "found": False, "notes": res["notes"],
-                                       "pages_without_extracted_offer": res["pages_without_extracted_offer"][:3]}))
-            continue
-        tiers: dict[int, list[dict[str, Any]]] = {}
-        for o in offers:
-            tiers.setdefault(N.relevance_tier(o, item), []).append(o)
-        ranked = [o for tier in sorted(tiers) for o in _rank(tiers[tier])]
-        best = ranked[0]
-        total += N.effective_price(best) or 0.0
-        per_item.append(N.compact({
-            "item": item,
-            "match": N.RELEVANCE_LABELS[N.relevance_tier(best, item)],
-            "best": _slim(best),
-            "alternatives": [_slim(o) for o in ranked[1:1 + alternatives]],
-            "_spec": _bring_spec(best),
-        }))
-        by_store.setdefault(best.get("retailer") or "?", []).append(N.compact({
-            "item": item, "product": " ".join(x for x in (best.get("brand"), best.get("product")) if x),
-            **_price_line(best),
-            "validity": best.get("validity"), "status": best.get("status"), "page": best.get("page"),
-            "viewer_url": best.get("viewer_url"), "cutout_url": best.get("cutout_url"),
-            "_from": best.get("valid_from"), "_until": best.get("valid_until"),
-        }))
-    bring_items = None
-    if prefs.load().get("shopping_list_app") == "bring":
-        bring_items = [{"name": entry["item"], "specification": entry["_spec"]}
-                       for entry in per_item if entry.get("_spec")]
-        bring_items += [{"name": item} for item in missing]
-    for entry in per_item:
-        entry.pop("_spec", None)
-    return _dump(N.compact({
+            entry.update(offers=[], error=str(res))
+
+    plans = _plans(entries, max_stores) if any(e["offers"] for e in entries) else []
+    out: dict[str, Any] = {
         "location": loc.get("label"),
         "store_filter": scope,
         "today": N.fmt_day(N.now_berlin().date()),
-        "apps": apps or "keine gespeichert (Preise ohne App)",
-        "by_store": {store: _store_plan(picks) for store, picks in by_store.items()},
-        "estimated_total_eur": round(total, 2),
-        "not_found": missing,
-        "items": per_item,
-        "bring_items": bring_items,
-    }))
+        "apps": prefs.apps() or "keine gespeichert (Preise ohne App)",
+        "source": ", ".join(sources),
+        "period": period,
+    }
+    rec_picks: dict[str, Any] = {}
+    if plans:
+        label, rec, why = _recommend(plans)
+        rec_picks = rec["picks"]
+        out["recommended"] = {"why": why, **_plan_out(label, rec, entries, detailed=True)}
+        out["other_plans"] = [_plan_out(lbl, ev, entries, detailed=False) for lbl, ev in plans if ev is not rec]
+    out["choose"] = [N.compact({
+        "item": e["item"],
+        "why": ("Sammelbegriff, breit gesucht: " + ", ".join(e["queries"])) if e.get("queries")
+               else "unsichere Treffer: " + N.RELEVANCE_LABELS.get(e.get("tier", 6), ""),
+        "options": [_compact_offer(o) for o in e["offers"][:4]],
+    }) for e in entries if e.get("flexible") and e["offers"]]
+    out["alternatives"] = {
+        e["item"]: [_compact_offer(o) for o in e["offers"]
+                    if o is not (rec_picks.get(e["item"]) or (None,))[0]][:alternatives]
+        for e in entries if e["offers"] and not e.get("flexible") and alternatives
+    }
+    out["not_found"] = [e["item"] for e in entries if not e["offers"]]
+    errors = {e["item"]: e["error"] for e in entries if e.get("error")}
+    if errors:
+        out["errors"] = errors
+    if from_bring_list or prefs.load().get("shopping_list_app") == "bring":
+        updates = []
+        for e in entries:
+            pick = rec_picks.get(e["item"])
+            if pick:
+                updates.append({"name": e["item"], "specification": _bring_spec(pick[0], e.get("note", ""), pick[1]),
+                                "discounted": True})
+            elif e.get("from_bring") and e.get("spec") and e["spec"] != e.get("note"):
+                updates.append({"name": e["item"], "specification": e.get("note", ""), "discounted": False})
+            elif not e.get("from_bring"):
+                updates.append({"name": e["item"]})
+        out["bring_updates"] = updates
+        out["next_step"] = ("Empfehlung, andere Pläne und Alternativen kurz vorstellen, bei 'choose' den Nutzer "
+                            "wählen lassen und fragen, ob es so in Bring! soll. Danach bring_add_items(items="
+                            "bring_updates). Wählt der Nutzer einen anderen Plan, shopping_list mit stores=<Märkte "
+                            "des Plans> erneut aufrufen.")
+    return _dump(N.compact(out))
 
 
 @mcp.tool()
@@ -872,9 +1105,22 @@ async def suggest_search_terms(
 # ====================================================================== Bring! shopping list
 
 class BringItemIn(BaseModel):
-    name: str = Field(description="Item as it should appear on the list, e.g. 'Butter', 'Hackfleisch'.")
+    name: str = Field(description="Short title as on a shopping list, e.g. 'Milch', 'Butter' (not the product name).")
     specification: str | None = Field(
-        default=None, description="Short note under the item, e.g. 'Meggle, Netto 0,99 €, bis Sa 17.10.'.")
+        default=None,
+        description="Beschreibung/Menge under the title: quantity plus where to buy, e.g. "
+                    "'2 l · bei Netto: Weihenstephan H-Milch 0,99 € bis Sa 17.10.'. None keeps the existing text, "
+                    "'' clears it.")
+    urgent: bool | None = Field(default=None, description="Flag 'Dringend'. None keeps the current value.")
+    convenient: bool | None = Field(default=None, description="Flag 'Wenn's passt' / bei Gelegenheit.")
+    discounted: bool | None = Field(default=None, description="Flag 'Im Angebot'. True for items bought on offer.")
+
+
+def _remember_attribute_type() -> None:
+    if bring.attribute_type_verified and prefs.load().get("bring_attribute_type") != bring.attribute_type:
+        data = prefs.load()
+        data["bring_attribute_type"] = bring.attribute_type
+        prefs.save(data)
 
 
 async def _bring_list(list_name: str | None) -> dict[str, str]:
@@ -974,15 +1220,19 @@ async def bring_select_list(
 async def bring_get_list(
     list_name: Annotated[str | None, Field(description="Other list than the selected one.")] = None,
 ) -> str:
-    """Show what is currently on the user's Bring! list (to buy, plus recently bought)."""
+    """Show what is on the user's Bring! list: title, Beschreibung/Menge and the flags dringend, wenn's passt,
+    im Angebot, plus recently bought items. To turn the list into a shopping plan use
+    shopping_list(from_bring_list=true)."""
     entry = await _bring_list(list_name)
     try:
         items = await bring.items(entry["uuid"])
     except BringError as exc:
         raise ToolError(str(exc)) from exc
+    _remember_attribute_type()
     return _dump({
         "list": entry["name"],
-        "to_buy": [N.compact({"name": i.get("name"), "specification": i.get("specification")})
+        "to_buy": [N.compact({key: i.get(key) for key in ("name", "specification", "urgent", "convenient",
+                                                          "discounted")})
                    for i in items["purchase"]],
         "recently_bought": [i.get("name") for i in items["recently"][:20]],
     })
@@ -994,14 +1244,22 @@ async def bring_add_items(
                                               description="Items to put on the list (existing ones get updated).")],
     list_name: Annotated[str | None, Field(description="Other list than the selected one.")] = None,
 ) -> str:
-    """Add items (with an optional note like store, price and validity) to the user's Bring! list.
-    Only call this after the user agreed. shopping_list returns ready-made bring_items."""
+    """Add or update items on the user's Bring! list: short title, Beschreibung/Menge (with where to buy) and
+    the flags dringend / wenn's passt / im Angebot. Only call this after the user agreed; shopping_list returns
+    ready-made bring_updates. Flags are read back, flags_saved tells whether Bring! really stored them."""
     entry = await _bring_list(list_name)
     try:
-        added = await bring.change(entry["uuid"], [i.model_dump() for i in items], "TO_PURCHASE")
+        payload = [i.model_dump() if isinstance(i, BaseModel) else BringItemIn(**i).model_dump() for i in items]
+        results = await bring.change(entry["uuid"], payload, "TO_PURCHASE")
     except BringError as exc:
         raise ToolError(str(exc)) from exc
-    return _dump({"list": entry["name"], "added_or_updated": added})
+    _remember_attribute_type()
+    out: dict[str, Any] = {"list": entry["name"], "items": results}
+    if any(r.get("flags_saved") is False for r in results):
+        out["note"] = ("Bring! hat die Markierungen (dringend/Angebot) nicht übernommen. Tipp: einmal in der Bring! "
+                       "App einen Artikel als dringend markieren, dann bring_get_list aufrufen; danach kennt der "
+                       "Server das Format und es klappt.")
+    return _dump(out)
 
 
 @mcp.tool()
@@ -1018,7 +1276,7 @@ async def bring_remove_items(
                                   "TO_RECENTLY" if mark_as_bought else "REMOVE")
     except BringError as exc:
         raise ToolError(str(exc)) from exc
-    return _dump({"list": entry["name"], "bought" if mark_as_bought else "removed": done})
+    return _dump({"list": entry["name"], "items": done})
 
 
 @mcp.tool()
@@ -1032,17 +1290,21 @@ async def bring_disconnect() -> str:
 
 
 @mcp.prompt(name="wocheneinkauf", description="Wocheneinkauf anhand der aktuellen Prospekte planen")
-def wocheneinkauf(einkaufsliste: str, woche: str = "aktuelle Woche") -> str:
+def wocheneinkauf(einkaufsliste: str = "meine Bring! Liste", woche: str = "aktuelle Woche") -> str:
     return (
         f"Plane meinen Einkauf für die {woche} mit kaufDA.\n"
         f"Einkaufsliste: {einkaufsliste}\n\n"
-        "1. Prüfe mit get_preferences Standort, Lieblingsmärkte und meine Apps/Kundenkarten "
+        "1. Prüfe mit get_preferences Standort, Lieblingsmärkte, meine Apps/Kundenkarten und ob ich Bring! nutze "
         "(frag nach, falls etwas fehlt).\n"
-        "2. Nutze shopping_list für die ganze Liste (when='upcoming' für nächste Woche).\n"
-        "3. Prüfe unsichere Treffer (match mit 'prüfen!') mit view_offer und sortiere Unpassendes aus.\n"
-        "4. Gib mir eine Liste pro Markt mit meinem Preis (your_price), Gültigkeit (ab wann / bis wann), "
-        "Bedingungen wie App Preise, Treuepunkte oder Mengenrabatte und dem kaufDA Link. Sag mir, wo ich mit "
-        "einer App, die ich nicht habe, noch sparen könnte, und nenne am Ende, was nirgends im Angebot ist."
+        "2. Nutze shopping_list (bei meiner Bring! Liste mit from_bring_list=true; when='upcoming' für nächste "
+        "Woche).\n"
+        "3. Stell mir den empfohlenen Plan vor und die anderen Pläne (z.B. weniger Märkte, etwas teurer), mit "
+        "meinem Preis, Gültigkeit (ab wann / bis wann), Bedingungen wie App Preise oder Mengenrabatte und Links.\n"
+        "4. Bei Sammelbegriffen wie 'Trinken' schlag mir die besten echten Deals vor; unsichere Treffer prüfst du "
+        "mit view_offer. Sag mir, wo ich mit einer App, die ich nicht habe, noch sparen könnte, und was nirgends "
+        "im Angebot ist.\n"
+        "5. Frag mich, welchen Plan ich will, und trag ihn nach meinem OK mit bring_add_items in Bring! ein "
+        "(kurze Titel, Menge + Markt + Preis in der Beschreibung, Im Angebot markiert)."
     )
 
 

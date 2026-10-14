@@ -1,4 +1,4 @@
-"""Offline tests for the Bring! integration against a simulated Bring! API.
+"""Offline tests for the Bring! integration against a simulated, stateful Bring! API.
 Run: uv run python tests/test_bring.py"""
 import asyncio
 import json
@@ -6,14 +6,26 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 import httpx
 
 from kaufda_mcp import bring as B
 
-CALLS: list[tuple[str, str, object]] = []
-STATE = {"token": "tok-1", "refresh": "ref-1", "n": 1, "items": [{"uuid": "u-butter", "itemId": "Butter", "specification": ""},
-                                     {"uuid": "u-rahm", "itemId": "Rahm", "specification": "200 g"}]}
+CALLS: list[tuple[str, str, str]] = []
+STATE: dict = {}
+
+
+def reset(accepted_attribute_type="PURCH_CONDITIONS"):
+    STATE.clear()
+    STATE.update(token="tok-1", refresh="ref-1", n=1, attr_type=accepted_attribute_type, recently=[], items=[
+        {"uuid": "u-butter", "itemId": "Butter", "specification": "2 Stück"},
+        {"uuid": "u-rahm", "itemId": "Rahm", "specification": "200 g · bei Lidl: Milbona Sahne 0,79 € bis Sa 17.10."},
+    ])
+
+
+def _find(item_id):
+    return next((i for i in STATE["items"] if i["itemId"] == item_id), None)
 
 
 def handler(request: httpx.Request) -> httpx.Response:
@@ -24,8 +36,7 @@ def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"Rahm": "Sahne", "Butter": "Butter", "Brot": "Brot"})
     assert request.headers["X-BRING-API-KEY"] == B.BRING_HEADERS["X-BRING-API-KEY"]
     if path == "/rest/v2/bringauth":
-        form = urllib.parse.parse_qs(body)
-        if form.get("password") != ["richtig"]:
+        if urllib.parse.parse_qs(body).get("password") != ["richtig"]:
             return httpx.Response(401, json={"message": "invalid"})
         return httpx.Response(200, json={"uuid": "U1", "publicUuid": "P1", "bringListUUID": "L1", "email": "a@b.de",
                                          "access_token": "tok-1", "refresh_token": "ref-1", "token_type": "Bearer",
@@ -47,13 +58,42 @@ def handler(request: httpx.Request) -> httpx.Response:
             {"listUuid": "L1", "usersettings": [{"key": "listArticleLanguage", "value": "de-DE"}]}]})
     if path == "/rest/v2/bringlists/L1" and method == "GET":
         return httpx.Response(200, json={"uuid": "L1", "status": "SHARED",
-                                         "items": {"purchase": STATE["items"], "recently": []}})
+                                         "items": {"purchase": STATE["items"], "recently": STATE["recently"]}})
+    if path == "/rest/v2/bringlists/L1" and method == "PUT":  # legacy, name addressed
+        form = {k: v[0] for k, v in urllib.parse.parse_qs(body, keep_blank_values=True).items()}
+        if form.get("purchase"):
+            item = _find(form["purchase"])
+            if item:
+                item["specification"] = form.get("specification", "")
+            else:
+                STATE["items"].append({"uuid": str(uuid.uuid4()), "itemId": form["purchase"],
+                                       "specification": form.get("specification", "")})
+        if form.get("remove"):
+            STATE["items"] = [i for i in STATE["items"] if i["itemId"] != form["remove"]]
+        if form.get("recently"):
+            item = _find(form["recently"])
+            STATE["items"] = [i for i in STATE["items"] if i["itemId"] != form["recently"]]
+            if item:
+                STATE["recently"].append(item)
+        return httpx.Response(204)
     if path == "/rest/v2/bringlists/L1/items" and method == "PUT":
+        for change in json.loads(body)["changes"]:
+            item = next((i for i in STATE["items"] if i["uuid"] == change["uuid"]), None)
+            attr = change.get("attribute") or {}
+            if change["operation"] == "ATTRIBUTE_UPDATE" and item and attr.get("type") == STATE["attr_type"]:
+                item["attributes"] = [{"type": attr["type"], "content": attr["content"]}]
         return httpx.Response(200)
     return httpx.Response(404)
 
 
+def _client():
+    store = B.MemoryStore()
+    store.save(B.login_sync("a@b.de", "richtig", transport=httpx.MockTransport(handler)))
+    return store, B.BringClient(store, transport=httpx.MockTransport(handler))
+
+
 def test_login_sync():
+    reset()
     session = B.login_sync("a@b.de", "richtig", transport=httpx.MockTransport(handler))
     assert session["uuid"] == "U1" and session["refresh_token"] == "ref-1" and "password" not in json.dumps(session)
     try:
@@ -63,38 +103,67 @@ def test_login_sync():
         pass
 
 
-async def _client_flow():
-    store = B.MemoryStore()
-    store.save(B.login_sync("a@b.de", "richtig", transport=httpx.MockTransport(handler)))
+async def _session_flow():
+    reset()
+    store, client = _client()
     store.data["expires_at"] = time.time() - 10  # expired -> refresh
-    client = B.BringClient(store, transport=httpx.MockTransport(handler))
-    lists = await client.lists()
-    assert [entry["name"] for entry in lists] == ["Zuhause", "Büro"]
+    assert [entry["name"] for entry in await client.lists()] == ["Zuhause", "Büro"]
     assert store.data["access_token"] == "tok-2" and store.data["refresh_token"] == "ref-2"
-    items = await client.items("L1")
-    assert {i["name"] for i in items["purchase"]} == {"Butter", "Sahne"}  # catalog id "Rahm" shown as "Sahne"
-    CALLS.clear()
-    await client.change("L1", [{"name": "Sahne", "specification": "Lidl 0,79 €, bis Sa 17.10."},
-                               {"name": "Butter", "specification": "Netto 0,99 €"},
-                               {"name": "Grillkohle"}], "TO_PURCHASE")
-    put = [json.loads(body) for method, path, body in CALLS if method == "PUT"][0]
-    changes = {c["itemId"]: c for c in put["changes"]}
-    assert changes["Rahm"]["spec"] == "Lidl 0,79 €, bis Sa 17.10." and changes["Rahm"]["uuid"] == "u-rahm"
-    assert changes["Butter"]["uuid"] == "u-butter" and changes["Grillkohle"]["operation"] == "TO_PURCHASE"
     STATE["token"] = "revoked"  # server side invalidation -> 401 -> refresh -> retry
     assert len(await client.lists()) == 2 and store.data["refresh_token"] == "ref-3"
-    STATE["token"], STATE["refresh"] = "revoked", "revoked"  # refresh token dead too -> clean auth error
+    STATE["token"], STATE["refresh"] = "revoked", "revoked"  # refresh token dead too
     try:
         await client.lists()
         raise AssertionError("dead session accepted")
     except B.BringAuthError as exc:
         assert "neu verbinden" in str(exc) and store.data is None
-    client.forget()
-    assert store.data is None
 
 
-def test_client_flow():
-    asyncio.run(_client_flow())
+def test_session_flow():
+    asyncio.run(_session_flow())
+
+
+async def _items_flow():
+    reset()
+    _, client = _client()
+    items = await client.items("L1")
+    assert {i["name"] for i in items["purchase"]} == {"Butter", "Sahne"}  # catalog id "Rahm" shown as "Sahne"
+    res = await client.change("L1", [
+        {"name": "Sahne", "specification": "200 g · bei Penny: Sahne 0,69 € bis Sa 17.10.", "discounted": True},
+        {"name": "Butter"},  # no specification -> keep "2 Stück"
+        {"name": "Grillkohle", "specification": "", "urgent": True},
+    ], "TO_PURCHASE")
+    by = {r["name"]: r for r in res}
+    assert _find("Rahm")["specification"].startswith("200 g · bei Penny")
+    assert _find("Butter")["specification"] == "2 Stück" and by["Butter"]["result"] == "aktualisiert"
+    assert by["Grillkohle"]["result"] == "hinzugefügt" and by["Grillkohle"]["flags_saved"] is True
+    assert by["Sahne"]["flags_saved"] is True and by["Sahne"]["flags"] == {"discounted": True}
+    after = {i["name"]: i for i in (await client.items("L1"))["purchase"]}
+    assert after["Sahne"].get("discounted") and after["Grillkohle"].get("urgent")
+    res = await client.change("L1", [{"name": "Butter"}, {"name": "Gibtsnicht"}], "TO_RECENTLY")
+    assert [r["result"] for r in res] == ["als gekauft abgehakt", "stand nicht auf der Liste"]
+    await client.change("L1", [{"name": "Grillkohle"}], "REMOVE")
+    assert {i["itemId"] for i in STATE["items"]} == {"Rahm"} and STATE["recently"][0]["itemId"] == "Butter"
+
+
+def test_items_flow():
+    asyncio.run(_items_flow())
+
+
+async def _attribute_type_is_learned():
+    reset(accepted_attribute_type="ITEM_FLAGS")  # Bring! uses another name than our default guess
+    _, client = _client()
+    res = await client.change("L1", [{"name": "Butter", "urgent": True}], "TO_PURCHASE")
+    assert res[0]["flags_saved"] is False and not client.attribute_type_verified
+    _find("Rahm")["attributes"] = [{"type": "ITEM_FLAGS", "content": {"urgent": True}}]  # user marks it in the app
+    await client.items("L1")
+    assert client.attribute_type == "ITEM_FLAGS" and client.attribute_type_verified
+    res = await client.change("L1", [{"name": "Butter", "urgent": True}], "TO_PURCHASE")
+    assert res[0]["flags_saved"] is True
+
+
+def test_attribute_type_is_learned():
+    asyncio.run(_attribute_type_is_learned())
 
 
 def _post(url, data, host=None):
@@ -106,6 +175,7 @@ def _post(url, data, host=None):
 
 
 def test_login_page():
+    reset()
     received = {}
     page = B.LoginPage(on_success=received.update,
                        login=lambda e, p: B.login_sync(e, p, transport=httpx.MockTransport(handler)), ttl_seconds=30)

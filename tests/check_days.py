@@ -22,7 +22,9 @@ async def run(label, fake_now=None, **kw):
         for p in patches:
             p.stop()
     print(f"\n=== {label} | today {out['today']} ===")
-    for store, plan in out["by_store"].items():
+    rec = out["recommended"]
+    print(f"  Plan: {rec['label']} | {rec['total_eur']} € | {out['period']}")
+    for store, plan in rec["by_store"].items():
         print(f"  {store}: {plan.get('shopping_window')} {plan.get('warning', '')}")
         for it in plan["items"]:
             print(f"     {it['item']:<12} {it.get('product','')[:34]:<34} {it.get('price_text','')!s:<9} {it.get('status')}")

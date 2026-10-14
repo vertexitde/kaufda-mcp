@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 import re
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
@@ -349,6 +350,9 @@ def personalize(offer: dict[str, Any], apps: Iterable[str] | None) -> dict[str, 
     offer["your_price"] = your
     if basis:
         offer["your_price_basis"] = basis
+    ref = offer.get("regular_price") or offer.get("uvp")
+    if ref and your and ref > your:
+        offer["discount_pct"] = round((1 - your / ref) * 100)
     unit = offer.get("unit_price_value") or {}
     ref = price if price is not None else (app or {}).get("price")
     if unit.get("eur") is not None and ref and your != ref:
@@ -691,6 +695,20 @@ RELEVANCE_LABELS = {
 }
 
 
+def _head_words(product: str | None) -> set[str]:
+    """Grundwörter of a product name: 'H-Milch' -> milch, 'Schweine-Hackfleisch' -> hackfleisch. Leaves out
+    modifiers ('Butter-Mandel-Stollen' is no butter) and ingredients ('Rama mit Butter')."""
+    heads: set[str] = set()
+    words = [w for w in re.split(r"[\s/,]+", (product or "").casefold()) if w]
+    for i, word in enumerate(words):
+        if i > 0 and norm(words[i - 1]) in ("mit", "auf", "in"):
+            continue
+        parts = [norm(p) for p in word.split("-") if norm(p)]
+        if parts:
+            heads.add(parts[-1].replace(" ", ""))
+    return heads
+
+
 def relevance_tier(offer: dict[str, Any], query: str) -> int:
     """0 = right category and the query word stands alone in the name ('H-Milch') ... 6 = loosely related.
 
@@ -698,13 +716,109 @@ def relevance_tier(offer: dict[str, Any], query: str) -> int:
     separates the real thing from compounds and accessories."""
     words = norm(query).split()
     hay = norm(" ".join(x for x in (offer.get("product"), offer.get("brand")) if x))
-    tokens = set(norm(offer.get("product")).split())
     found = sum(1 for w in words if w in hay)
     full, partial = bool(words) and found == len(words), found > 0
-    exact = full and any(w in tokens for w in words)
+    exact = full and any(w in _head_words(offer.get("product")) for w in words)
     if offer.get("category_match"):
         return 0 if exact else 1 if full else 2 if partial else 3
     return 4 if full else 5 if partial else 6
+
+
+# ---------------------------------------------------------------- shopping list helpers
+
+_DRINKS = ["Mineralwasser", "Cola", "Apfelsaft", "Orangensaft", "Limonade", "Eistee"]
+_SNACKS = ["Chips", "Erdnüsse", "Salzstangen", "Schokolade", "Kekse"]
+_SWEETS = ["Schokolade", "Fruchtgummi", "Kekse", "Pralinen"]
+_GRILL = ["Grillwurst", "Nackensteak", "Grillkäse", "Grillkohle"]
+_CLEANING = ["Spülmittel", "Allzweckreiniger", "Küchenrolle", "Toilettenpapier"]
+_FROZEN = ["Pizza", "Pommes", "Fischstäbchen", "Eis"]
+# Umbrella terms people put on shopping lists; kaufDA's search finds nothing useful for them directly.
+GENERIC_TERMS: dict[str, list[str]] = {
+    "trinken": _DRINKS, "getraenke": _DRINKS, "was zu trinken": _DRINKS, "softdrinks": ["Cola", "Limonade", "Eistee"],
+    "saft": ["Apfelsaft", "Orangensaft", "Multivitaminsaft"],
+    "snacks": _SNACKS, "knabberzeug": _SNACKS, "knabberkram": _SNACKS, "chips und so": _SNACKS,
+    "suesses": _SWEETS, "suessigkeiten": _SWEETS, "naschzeug": _SWEETS,
+    "obst": ["Äpfel", "Bananen", "Weintrauben", "Orangen", "Mandarinen", "Birnen"],
+    "gemuese": ["Tomaten", "Paprika", "Gurke", "Möhren", "Zucchini", "Brokkoli"],
+    "fruehstueck": ["Toast", "Brötchen", "Marmelade", "Müsli", "Frischkäse"],
+    "aufschnitt": ["Salami", "Schinken", "Käseaufschnitt", "Mortadella"], "belag": ["Salami", "Schinken", "Käseaufschnitt"],
+    "fleisch": ["Hackfleisch", "Schnitzel", "Hähnchenbrust", "Steak"],
+    "grillen": _GRILL, "grillzeug": _GRILL, "grillsachen": _GRILL,
+    "putzzeug": _CLEANING, "putzmittel": _CLEANING, "haushalt": _CLEANING,
+    "drogerie": ["Duschgel", "Shampoo", "Zahnpasta", "Deo"],
+    "tk": _FROZEN, "tiefkuehl": _FROZEN, "tiefkuehlzeug": _FROZEN,
+    "tierfutter": ["Katzenfutter", "Hundefutter"],
+}
+
+
+def generic_queries(item: str) -> list[str] | None:
+    return GENERIC_TERMS.get(norm(item))
+
+
+_SPEC_STORE_PART = re.compile(r"(?:^|\s*·\s*)bei [^:]{1,40}:.*$", re.S)
+
+
+def user_spec_part(spec: str | None) -> str:
+    """The user's own note (Menge, Sorte) without the store part this server wrote earlier."""
+    return _SPEC_STORE_PART.sub("", spec or "").strip(" ·")
+
+
+Need = int | tuple[str, float] | None  # pack count, amount like ("l", 2.0), or unknown
+
+
+def parse_need(user_note: str | None) -> Need:
+    """'3', '2x', '2 Flaschen' -> 3/2/2 packs; '2 l', '500 g' -> amount; anything else -> None."""
+    t = (user_note or "").lower().replace(",", ".").strip()
+    if not t:
+        return None
+    m = re.fullmatch(r"(\d+)\s*(x|×|mal|stk\.?|stück|st\.?|packung(en)?|pck\.?|pack|dosen?|flaschen?|becher|"
+                     r"gläser|glas|beutel|kisten?|tüten?|netze?|bund|kästen|kasten)?", t)
+    if m:
+        return max(1, min(int(m.group(1)), 50))
+    return parse_quantity(t)
+
+
+def pack_amount(offer: dict[str, Any]) -> tuple[str, float] | None:
+    """Pack size from the text, else derived from price / Grundpreis (12 x 1 l for 8,00 € at 0,67 €/l -> 12 l)."""
+    qty = parse_quantity(offer.get("description"), offer.get("product"))
+    if qty:
+        return qty
+    unit = offer.get("unit_price_value") or {}
+    price = offer.get("price") if offer.get("price") is not None else (offer.get("app_price") or {}).get("price")
+    if unit.get("per") in ("kg", "l") and unit.get("eur") and price and not unit.get("estimated"):
+        return unit["per"], round(price / unit["eur"], 3)
+    return None
+
+
+def packs_needed(need: Need, offer: dict[str, Any], usual_pack: tuple[str, float] | None = None,
+                 exact: bool = True) -> int:
+    """usual_pack is assumed when the offer does not reveal its size (e.g. 'Frische Milch' without '1 l').
+    exact=False (need only guessed, nothing on the list): round instead of rounding up, so 225 g Rama
+    against a usual 250 g pack stays one pack."""
+    if isinstance(need, int):
+        return need
+    pack = pack_amount(offer) or usual_pack
+    if need and pack and need[0] == pack[0] and pack[1] > 0:
+        ratio = need[1] / pack[1]
+        return max(1, min(math.ceil(ratio - 1e-9) if exact else round(ratio), 50))
+    return 1
+
+
+def typical_need(offers: list[dict[str, Any]]) -> Need:
+    """Without a quantity on the list assume one usual pack, so a 12 x 1 l crate does not win against a single
+    litre just because of its Grundpreis. Brochures are full of multipacks, so the lower quartile of the pack
+    sizes is taken (1 l for milk), which still ignores the odd mini pack."""
+    sizes = [p for p in (pack_amount(o) for o in offers) if p]
+    if not sizes:
+        return None
+    unit = Counter(p[0] for p in sizes).most_common(1)[0][0]
+    amounts = sorted(p[1] for p in sizes if p[0] == unit)
+    return unit, amounts[(len(amounts) - 1) // 4]
+
+
+def desired_count(user_note: str | None, offer: dict[str, Any]) -> int:
+    """How many packs to buy: '3', '2x', '2 Flaschen' or an amount like '2 l' against the pack size."""
+    return packs_needed(parse_need(user_note), offer)
 
 
 def effective_price(offer: dict[str, Any]) -> float | None:

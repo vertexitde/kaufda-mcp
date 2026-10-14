@@ -12,8 +12,10 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 * **Verifizierbar:** Jedes Angebot hat eine `cutout_url` auf den Ausschnitt aus dem Prospekt (mit Preis, kein reines Produktfoto). Die KI kann sich Ausschnitt, Umgebung oder die ganze Prospektseite als Bild ansehen und so Preis und Zeitraum selbst gegenprüfen. Zu jedem Treffer gibt es einen kaufDA Link auf die passende Seite.
 * **Vergleichbar:** Grundpreise (€/kg, €/l) werden ausgewertet und, wo sie fehlen, aus der Packungsgröße geschätzt.
 * **Dein Profil bleibt gespeichert:** Standort, Lieblingsmärkte und Suchradius werden lokal gespeichert und gelten für jede weitere Unterhaltung.
-* **Einkaufsplanung:** Für jeden Markt wird berechnet, an welchen Tagen alle ausgewählten Angebote gleichzeitig gelten.
-* **Direkt in Bring!:** Die Einkaufsliste wird auf Wunsch in deine Bring! Liste übertragen, z.B. *Butter* mit der Notiz *"Meggle, Netto 0,99 €, bis Sa 17.10."*. Bekannte Artikel bekommen das passende Bring! Symbol.
+* **Einkaufsplan statt Einzelpreise:** Für die ganze Liste rechnet der Server aus, wo du insgesamt am günstigsten wegkommst: bester Mix über alle Märkte gegen den besten Plan mit 1, 2 oder 3 Märkten. Er empfiehlt den Plan mit den wenigsten Wegen, der kaum teurer ist ("nur 3 statt 4 Märkte, ca. 0,26 € teurer"), und zeigt die Alternativen. Gerechnet wird mit der Menge, die du brauchst ("Milch, 2 l" ergibt 2 × 1 l, nicht die 12er Kiste mit dem besten Literpreis).
+* **Sammelbegriffe:** Steht nur "Trinken", "Snacks" oder "Grillzeug" auf der Liste, sucht die KI breit (Wasser, Cola, Saft, ...) und schlägt die echten Deals nach Rabatt vor.
+* **Einkaufszeitraum:** Standard ist diese Woche bis Samstag, inklusive Angeboten ab Donnerstag. Für jeden Markt wird berechnet, an welchen Tagen alle ausgewählten Angebote gleichzeitig gelten. Dringende Artikel bekommen nur Angebote, die heute schon gelten.
+* **Bring! lesen und schreiben:** *"Schau dir meine Einkaufsliste an und mach einen Plan"* liest deine Bring! Liste, inklusive deiner Mengenangaben und der Markierung *Dringend*. Nach deinem OK schreibt die KI den Plan zurück: kurzer Titel (*Milch*), in der Beschreibung deine Menge plus Markt, Produkt, Preis und Gültigkeit (*"2 l · bei Netto: Bärenmarke Frische Milch 2 × 0,88 € ab Do 15.10."*) und die Markierung *Im Angebot*. Deine eigene Notiz bleibt beim nächsten Plan erhalten, nur der Marktteil wird ersetzt.
 
 ## Tools
 
@@ -22,7 +24,7 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 | `get_preferences` | Gespeicherten Standort, Lieblingsmärkte, genutzte Apps/Kundenkarten und Suchradius anzeigen |
 | `set_preferences` | Standort (PLZ, Ort oder Adresse), Lieblingsmärkte, Apps/Kundenkarten und Radius speichern |
 | `search_offers` | Produkt suchen: Preis, Grundpreis, UVP oder Normalpreis, Bedingungen, Gültigkeit, Markt, Prospektseite und Link |
-| `shopping_list` | Ganze Einkaufsliste auf einmal: bestes Angebot pro Artikel, gruppiert nach Markt, mit Einkaufszeitraum und Alternativen |
+| `shopping_list` | Einkaufsplan für eine Liste (Eingabe oder direkt die Bring! Liste): Empfehlung, Vergleichspläne mit 1/2/3 Märkten, Alternativen, Auswahl bei Sammelbegriffen, fertige Bring! Updates |
 | `list_brochures` | Aktuelle und kommende Prospekte in der Nähe, mit nächster Filiale und Entfernung |
 | `get_brochure_offers` | Alle Angebote eines Prospekts, filterbar nach Suchbegriff oder Seite |
 | `view_brochure_page` | Prospektseite als Bild plus die erkannten Angebote dieser Seite |
@@ -31,8 +33,8 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 | `bring_connect` | Bring! verbinden: liefert einen einmaligen lokalen Login Link (siehe unten) |
 | `bring_status` | Verbindung, Konto und vorhandene Bring! Listen anzeigen |
 | `bring_select_list` | Bring! Liste auswählen, in die eingekauft wird |
-| `bring_get_list` | Aktuellen Inhalt der Bring! Liste anzeigen |
-| `bring_add_items` | Artikel mit Notiz (Markt, Preis, Gültigkeit) auf die Liste setzen |
+| `bring_get_list` | Bring! Liste anzeigen: Titel, Beschreibung/Menge, Dringend, Wenn's passt, Im Angebot |
+| `bring_add_items` | Artikel anlegen oder aktualisieren: Beschreibung/Menge und die Markierungen Dringend, Wenn's passt, Im Angebot |
 | `bring_remove_items` | Artikel löschen oder als gekauft abhaken |
 | `bring_disconnect` | Verbindung trennen und gespeicherte Sitzung löschen |
 
@@ -86,6 +88,8 @@ Die KI fragt einmal, ob du eine Einkaufslisten App nutzt. Sagst du *"Ja, Bring!"
 4. Hast du mehrere Listen, fragt die KI, welche sie nutzen soll.
 5. Nach jeder Einkaufsplanung fragt die KI, ob sie die Artikel in Bring! eintragen soll.
 
+Die Markierungen (Dringend, Wenn's passt, Im Angebot) sind in keiner öffentlichen Doku beschrieben. Der Server liest sie bei jedem Artikel mit, lernt das Format von Artikeln, die du in der App markiert hast, und prüft nach jedem Schreiben, ob Bring! sie wirklich übernommen hat. Falls nicht, sagt die KI dir das: einmal in der App einen Artikel als dringend markieren, danach klappt es.
+
 **Ohne Browser (Server, Bot):**
 
 ```bash
@@ -105,6 +109,8 @@ Bring! bietet keine offizielle API. Genutzt werden die Endpunkte der Bring! Apps
 * *"Was hat Lidl nächste Woche im Prospekt? Zeig mir die Seite mit dem Kaffee."*
 * *"Gibt es am Samstag irgendwo Bier im Angebot?"*
 * *"Ich nutze Bring!, pack die Sachen auf meine Liste Zuhause."*
+* *"Schau dir meine Einkaufsliste an und mach daraus einen Einkaufsplan. Wo komm ich insgesamt am günstigsten weg?"*
+* *"Bei Trinken such mir was Gutes raus, ich will nicht in mehr als zwei Läden."*
 
 ## Entwicklung
 
@@ -117,6 +123,7 @@ uv run python tests/smoke_stdio.py      # Server per stdio wie ein MCP Client st
 uv run python tests/check_days.py       # Gültigkeit abhängig vom Wochentag
 uv run python tests/test_bring.py       # Bring! gegen simulierte API, inkl. Login Seite
 uv run python tests/smoke_bring_stdio.py  # Bring! Ablauf über das MCP Protokoll
+uv run python tests/smoke_plan.py      # Einkaufsplan aus simulierter Bring! Liste mit echten Angeboten
 ```
 
 Aufbau: `client.py` (HTTP Zugriff auf kaufDA und Geocoding), `normalize.py` (Preise, Gültigkeit, Relevanz), `prefs.py` (gespeichertes Profil), `bring.py` (Bring! Client, Schlüsselspeicher, Login Seite), `server.py` (MCP Tools).
