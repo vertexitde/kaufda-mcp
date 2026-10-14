@@ -70,10 +70,13 @@ they log in there themselves. NEVER ask for the Bring! password in chat. Afterwa
 lists; if there are several, ask which one and call bring_select_list. "Schau dir meine Einkaufsliste an und \
 mach einen Plan" = shopping_list(from_bring_list=true): the user's notes (e.g. "2 l") count as quantity, \
 items marked urgent only get offers valid today. shopping_list returns bring_updates for the recommended plan: \
-short title ("Milch"), Beschreibung/Menge = the user's note + " · bei <Markt>: <Produkt> <Preis> <ab/bis>", \
-flag discounted=true. After the user agrees, pass them to bring_add_items. Keep titles short; product names, \
-brands and stores belong in the specification. Flags: urgent (Dringend), convenient (Wenn's passt), \
-discounted (Im Angebot).
+short title ("Milch"), Beschreibung = ONLY the store ("Lidl"; with the user's own quantity note: "2 l · \
+Lidl"), flag discounted=true. Never write prices, products, app hints or alternatives into Bring!: the user \
+knows their apps and cards, the list must stay readable. ASK FIRST: settle choices and alternatives with \
+direct questions in the chat ("Trinken: Pepsi bei Lidl oder Sinalco bei Penny?"), then write exactly the \
+chosen store. Only after the user's OK call bring_add_items. Its result reads the list back (on_list, \
+spec_saved, flags_saved), so report truthfully what really arrived in Bring!. Flags: urgent (Dringend), \
+convenient (Wenn's passt), discounted (Im Angebot).
 """
 
 mcp = FastMCP("kaufda", instructions=INSTRUCTIONS, log_level=os.environ.get("KAUFDA_MCP_LOGLEVEL", "WARNING").upper())
@@ -474,15 +477,11 @@ def _when_text(offer: dict[str, Any]) -> str:
     return ""
 
 
-def _bring_spec(offer: dict[str, Any], user_note: str = "", count: int = 1) -> str:
-    """'2 l · bei Netto: Weihenstephan H-Milch 2 × 0,99 € bis Sa 17.10.' The part from 'bei' on is replaced
-    on the next plan, the user's own note (Menge, Sorte) stays."""
-    product = " ".join(x for x in (offer.get("brand"), offer.get("product")) if x)
-    price = _price_line(offer).get("price_text") or ""
-    if count > 1 and price:
-        price = f"{count} × {price}"
-    store = f"bei {_short(offer.get('retailer'))}: " + " ".join(x for x in (product, price, _when_text(offer)) if x)
-    return (f"{user_note} · {store}" if user_note else store)[:250]
+def _bring_spec(offer: dict[str, Any], user_note: str = "") -> str:
+    """Only the store, so it stays readable in the app: 'Lidl', or '2 l · Lidl' when the user noted a quantity.
+    Prices, products and alternatives are discussed in the chat, not written to the list."""
+    store = _short(offer.get("retailer"))
+    return f"{user_note} · {store}" if user_note else store
 
 
 def _compact_offer(offer: dict[str, Any]) -> dict[str, Any]:
@@ -803,17 +802,18 @@ async def shopping_list(
         for e in entries:
             pick = rec_picks.get(e["item"])
             if pick:
-                updates.append({"name": e["item"], "specification": _bring_spec(pick[0], e.get("note", ""), pick[1]),
+                updates.append({"name": e["item"], "specification": _bring_spec(pick[0], e.get("note", "")),
                                 "discounted": True})
             elif e.get("from_bring") and e.get("spec") and e["spec"] != e.get("note"):
                 updates.append({"name": e["item"], "specification": e.get("note", ""), "discounted": False})
             elif not e.get("from_bring"):
                 updates.append({"name": e["item"]})
         out["bring_updates"] = updates
-        out["next_step"] = ("Empfehlung, andere Pläne und Alternativen kurz vorstellen, bei 'choose' den Nutzer "
-                            "wählen lassen und fragen, ob es so in Bring! soll. Danach bring_add_items(items="
-                            "bring_updates). Wählt der Nutzer einen anderen Plan, shopping_list mit stores=<Märkte "
-                            "des Plans> erneut aufrufen.")
+        out["next_step"] = ("ERST FRAGEN, dann schreiben: Empfehlung und Alternativen kurz im Chat zeigen, bei "
+                            "'choose' den Nutzer direkt entscheiden lassen (z.B. 'Pepsi bei Lidl oder Sinalco bei "
+                            "Penny?'). Erst nach seinem OK bring_add_items(items=bring_updates). In Bring! steht als "
+                            "Beschreibung nur der Markt (plus seine eigene Mengenangabe); passe bring_updates an seine "
+                            "Wahl an. Anderen Plan gewählt: shopping_list mit stores=<Märkte des Plans>.")
     return _dump(N.compact(out))
 
 
@@ -1108,8 +1108,8 @@ class BringItemIn(BaseModel):
     name: str = Field(description="Short title as on a shopping list, e.g. 'Milch', 'Butter' (not the product name).")
     specification: str | None = Field(
         default=None,
-        description="Beschreibung/Menge under the title: quantity plus where to buy, e.g. "
-                    "'2 l · bei Netto: Weihenstephan H-Milch 0,99 € bis Sa 17.10.'. None keeps the existing text, "
+        description="Beschreibung under the title: ONLY the store, e.g. 'Lidl', or the user's own quantity plus "
+                    "store, e.g. '2 l · Lidl'. No prices or product details. None keeps the existing text, "
                     "'' clears it.")
     urgent: bool | None = Field(default=None, description="Flag 'Dringend'. None keeps the current value.")
     convenient: bool | None = Field(default=None, description="Flag 'Wenn's passt' / bei Gelegenheit.")
@@ -1244,9 +1244,10 @@ async def bring_add_items(
                                               description="Items to put on the list (existing ones get updated).")],
     list_name: Annotated[str | None, Field(description="Other list than the selected one.")] = None,
 ) -> str:
-    """Add or update items on the user's Bring! list: short title, Beschreibung/Menge (with where to buy) and
-    the flags dringend / wenn's passt / im Angebot. Only call this after the user agreed; shopping_list returns
-    ready-made bring_updates. Flags are read back, flags_saved tells whether Bring! really stored them."""
+    """Add or update items on the user's Bring! list: short title, Beschreibung = just the store (plus the
+    user's own quantity) and the flags dringend / wenn's passt / im Angebot. Only call this after the user
+    explicitly agreed in the chat; shopping_list returns ready-made bring_updates. The list is read back
+    afterwards: on_list, spec_saved and flags_saved tell what Bring! really stored."""
     entry = await _bring_list(list_name)
     try:
         payload = [i.model_dump() if isinstance(i, BaseModel) else BringItemIn(**i).model_dump() for i in items]
@@ -1255,6 +1256,12 @@ async def bring_add_items(
         raise ToolError(str(exc)) from exc
     _remember_attribute_type()
     out: dict[str, Any] = {"list": entry["name"], "items": results}
+    failed = [r["name"] for r in results if r.get("on_list") is False or r.get("spec_saved") is False]
+    if failed:
+        out["warning"] = (f"Nicht wie gewünscht in Bring! angekommen: {', '.join(failed)}. Dem Nutzer ehrlich so "
+                          "sagen, nicht als erledigt melden.")
+    else:
+        out["verified"] = "Alles zurückgelesen: steht so in Bring!."
     if any(r.get("flags_saved") is False for r in results):
         out["note"] = ("Bring! hat die Markierungen (dringend/Angebot) nicht übernommen. Tipp: einmal in der Bring! "
                        "App einen Artikel als dringend markieren, dann bring_get_list aufrufen; danach kennt der "
@@ -1303,8 +1310,9 @@ def wocheneinkauf(einkaufsliste: str = "meine Bring! Liste", woche: str = "aktue
         "4. Bei Sammelbegriffen wie 'Trinken' schlag mir die besten echten Deals vor; unsichere Treffer prüfst du "
         "mit view_offer. Sag mir, wo ich mit einer App, die ich nicht habe, noch sparen könnte, und was nirgends "
         "im Angebot ist.\n"
-        "5. Frag mich, welchen Plan ich will, und trag ihn nach meinem OK mit bring_add_items in Bring! ein "
-        "(kurze Titel, Menge + Markt + Preis in der Beschreibung, Im Angebot markiert)."
+        "5. Frag mich direkt, welchen Plan und welche Alternativen ich will, und trag es erst nach meinem OK mit "
+        "bring_add_items in Bring! ein: kurzer Titel, als Beschreibung nur der Markt (bzw. meine Menge plus Markt), "
+        "Im Angebot markiert. Keine Preise oder Produkte in die Beschreibung."
     )
 
 

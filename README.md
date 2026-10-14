@@ -15,7 +15,7 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 * **Einkaufsplan statt Einzelpreise:** Für die ganze Liste rechnet der Server aus, wo du insgesamt am günstigsten wegkommst: bester Mix über alle Märkte gegen den besten Plan mit 1, 2 oder 3 Märkten. Er empfiehlt den Plan mit den wenigsten Wegen, der kaum teurer ist ("nur 3 statt 4 Märkte, ca. 0,26 € teurer"), und zeigt die Alternativen. Gerechnet wird mit der Menge, die du brauchst ("Milch, 2 l" ergibt 2 × 1 l, nicht die 12er Kiste mit dem besten Literpreis).
 * **Sammelbegriffe:** Steht nur "Trinken", "Snacks" oder "Grillzeug" auf der Liste, sucht die KI breit (Wasser, Cola, Saft, ...) und schlägt die echten Deals nach Rabatt vor.
 * **Einkaufszeitraum:** Standard ist diese Woche bis Samstag, inklusive Angeboten ab Donnerstag. Für jeden Markt wird berechnet, an welchen Tagen alle ausgewählten Angebote gleichzeitig gelten. Dringende Artikel bekommen nur Angebote, die heute schon gelten.
-* **Bring! lesen und schreiben:** *"Schau dir meine Einkaufsliste an und mach einen Plan"* liest deine Bring! Liste, inklusive deiner Mengenangaben und der Markierung *Dringend*. Nach deinem OK schreibt die KI den Plan zurück: kurzer Titel (*Milch*), in der Beschreibung deine Menge plus Markt, Produkt, Preis und Gültigkeit (*"2 l · bei Netto: Bärenmarke Frische Milch 2 × 0,88 € ab Do 15.10."*) und die Markierung *Im Angebot*. Deine eigene Notiz bleibt beim nächsten Plan erhalten, nur der Marktteil wird ersetzt.
+* **Bring! lesen und schreiben:** *"Schau dir meine Einkaufsliste an und mach einen Plan"* liest deine Bring! Liste, inklusive deiner Mengenangaben und der Markierung *Dringend*. Alternativen und Entscheidungen klärt die KI vorher direkt mit dir im Chat (*"Trinken: Pepsi bei Lidl oder Sinalco bei Penny?"*). Erst nach deinem OK schreibt sie zurück, und zwar bewusst knapp: kurzer Titel (*Milch*), als Beschreibung nur der Markt (*Lidl*, bzw. *2 l · Lidl*, wenn du selbst eine Menge notiert hast) und die Markierung *Im Angebot*. Preise und App Hinweise landen nicht in der Liste, die KI kennt deine Kundenkarten ja. Danach wird die Liste zurückgelesen, damit die KI nur meldet, was wirklich angekommen ist.
 
 ## Tools
 
@@ -34,7 +34,7 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 | `bring_status` | Verbindung, Konto und vorhandene Bring! Listen anzeigen |
 | `bring_select_list` | Bring! Liste auswählen, in die eingekauft wird |
 | `bring_get_list` | Bring! Liste anzeigen: Titel, Beschreibung/Menge, Dringend, Wenn's passt, Im Angebot |
-| `bring_add_items` | Artikel anlegen oder aktualisieren: Beschreibung/Menge und die Markierungen Dringend, Wenn's passt, Im Angebot |
+| `bring_add_items` | Artikel anlegen oder aktualisieren (Beschreibung = Markt, Markierungen Dringend, Wenn's passt, Im Angebot), mit Rückprüfung |
 | `bring_remove_items` | Artikel löschen oder als gekauft abhaken |
 | `bring_disconnect` | Verbindung trennen und gespeicherte Sitzung löschen |
 
@@ -86,7 +86,7 @@ Die KI fragt einmal, ob du eine Einkaufslisten App nutzt. Sagst du *"Ja, Bring!"
 2. Dort meldest du dich mit deinen Bring! Zugangsdaten an. **Die KI sieht dein Passwort nie**, es geht direkt an Bring!.
 3. Gespeichert wird nur das Sitzungstoken von Bring!, nicht dein Passwort, und zwar im Schlüsselspeicher deines Systems (Windows Anmeldeinformationsverwaltung, macOS Schlüsselbund, Secret Service unter Linux). Abgelaufene Tokens werden automatisch erneuert.
 4. Hast du mehrere Listen, fragt die KI, welche sie nutzen soll.
-5. Nach jeder Einkaufsplanung fragt die KI, ob sie die Artikel in Bring! eintragen soll.
+5. Nach jeder Einkaufsplanung fragt die KI dich direkt nach deiner Wahl und trägt erst nach deinem OK ein: nur der Markt als Beschreibung, deine eigene Mengenangabe bleibt davor stehen.
 
 Die Markierungen (Dringend, Wenn's passt, Im Angebot) sind in keiner öffentlichen Doku beschrieben. Der Server liest sie bei jedem Artikel mit, lernt das Format von Artikeln, die du in der App markiert hast, und prüft nach jedem Schreiben, ob Bring! sie wirklich übernommen hat. Falls nicht, sagt die KI dir das: einmal in der App einen Artikel als dringend markieren, danach klappt es.
 

@@ -138,10 +138,12 @@ async def _items_flow():
     assert _find("Butter")["specification"] == "2 Stück" and by["Butter"]["result"] == "aktualisiert"
     assert by["Grillkohle"]["result"] == "hinzugefügt" and by["Grillkohle"]["flags_saved"] is True
     assert by["Sahne"]["flags_saved"] is True and by["Sahne"]["flags"] == {"discounted": True}
+    assert all(r["on_list"] for r in res) and by["Sahne"]["spec_saved"] and by["Grillkohle"]["spec_saved"]
     after = {i["name"]: i for i in (await client.items("L1"))["purchase"]}
     assert after["Sahne"].get("discounted") and after["Grillkohle"].get("urgent")
     res = await client.change("L1", [{"name": "Butter"}, {"name": "Gibtsnicht"}], "TO_RECENTLY")
     assert [r["result"] for r in res] == ["als gekauft abgehakt", "stand nicht auf der Liste"]
+    assert res[0]["verified"] is True and "verified" not in res[1]
     await client.change("L1", [{"name": "Grillkohle"}], "REMOVE")
     assert {i["itemId"] for i in STATE["items"]} == {"Rahm"} and STATE["recently"][0]["itemId"] == "Butter"
 

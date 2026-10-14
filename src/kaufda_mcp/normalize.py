@@ -755,12 +755,28 @@ def generic_queries(item: str) -> list[str] | None:
     return GENERIC_TERMS.get(norm(item))
 
 
-_SPEC_STORE_PART = re.compile(r"(?:^|\s*·\s*)bei [^:]{1,40}:.*$", re.S)
+_SPEC_STORE_PART = re.compile(r"(?:^|\s*·\s*)bei [^:]{1,40}:.*$", re.S)  # format of versions <= 0.5.0
+KNOWN_STORES = {
+    norm(s) for s in (
+        "Lidl", "Aldi", "ALDI Nord", "ALDI SÜD", "Penny", "Netto", "Netto Scottie", "Netto Marken-Discount",
+        "Netto mit dem Scottie", "Edeka", "E center", "Marktkauf", "REWE", "nahkauf", "Kaufland", "famila",
+        "Markant", "Norma", "Globus", "tegut", "HIT", "Combi", "Sky", "Real", "Metro", "Denns", "Denns BioMarkt",
+        "Alnatura", "dm", "Rossmann", "Müller", "Budni", "Thomas Philipps", "Action", "Jawoll",
+    )
+}
+
+
+def is_store_name(text: str | None) -> bool:
+    return norm(text) in KNOWN_STORES
 
 
 def user_spec_part(spec: str | None) -> str:
-    """The user's own note (Menge, Sorte) without the store part this server wrote earlier."""
-    return _SPEC_STORE_PART.sub("", spec or "").strip(" ·")
+    """The user's own note (Menge, Sorte) without the store this server wrote earlier ('2 l · Lidl' -> '2 l')."""
+    text = _SPEC_STORE_PART.sub("", spec or "").strip(" ·")
+    parts = [p.strip() for p in text.split("·") if p.strip()]
+    if parts and is_store_name(parts[-1]):
+        parts = parts[:-1]
+    return " · ".join(parts)
 
 
 Need = int | tuple[str, float] | None  # pack count, amount like ("l", 2.0), or unknown

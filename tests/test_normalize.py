@@ -118,6 +118,8 @@ def test_quantity():
 def test_shopping_list_helpers():
     assert N.user_spec_part("2 l · bei Netto: Weihenstephan H-Milch 0,99 € bis Sa 17.10.") == "2 l"
     assert N.user_spec_part("bei Lidl: Milbona Butter 1,79 €") == "" and N.user_spec_part("fettarm") == "fettarm"
+    assert N.user_spec_part("2 l · Lidl") == "2 l" and N.user_spec_part("Netto Scottie") == ""
+    assert N.user_spec_part("fettarm · 2 l · Penny") == "fettarm · 2 l" and N.user_spec_part("Bio") == "Bio"
     pack = {"description": "1 l", "product": "H-Milch"}
     assert N.desired_count("2 l", pack) == 2 and N.desired_count("3", pack) == 3 and N.desired_count("2 Flaschen", pack) == 2
     assert N.desired_count("1,5 l", pack) == 2 and N.desired_count("fettarm", pack) == 1 and N.desired_count("", pack) == 1

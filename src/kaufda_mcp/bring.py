@@ -379,8 +379,8 @@ class BringClient:
                 if spec is None:
                     spec = (existing or {}).get("specification") or ""
                 await self._legacy(list_uuid, purchase=(existing or {}).get("item_id") or key, specification=spec[:250])
-                results.append(N.compact({"name": name, "result": "aktualisiert" if existing else "hinzugefügt",
-                                          "specification": spec}))
+                results.append({"name": name, "result": "aktualisiert" if existing else "hinzugefügt",
+                                "specification": spec[:250]})
                 wanted = {k: item[k] for k in FLAG_KEYS if item.get(k) is not None}
                 if wanted:
                     merged = {k: bool((existing or {}).get(k)) for k in FLAG_KEYS} | wanted
@@ -394,15 +394,28 @@ class BringClient:
                         await self._set_flags(list_uuid, target, flags)
                     except BringError as exc:
                         log.warning("bring flags %s: %s", name, exc)
-            check = {N.norm(i["name"]): i for i in (await self.items(list_uuid))["purchase"]}
-            by_name = {N.norm(r["name"]): r for r in results}
-            for name, flags in flag_jobs:
-                got = check.get(N.norm(name)) or {}
-                ok = all(bool(got.get(k)) == v for k, v in flags.items())
-                by_name[N.norm(name)]["flags"] = {k: v for k, v in flags.items() if v} or "keine"
-                by_name[N.norm(name)]["flags_saved"] = ok
-                if ok:
-                    self.attribute_type_verified = True
+        if results:
+            # Read back what Bring! really stored, so the assistant never reports a write that did not arrive.
+            fresh = await self.items(list_uuid)
+            to_buy = {N.norm(i["name"]): i for i in fresh["purchase"]}
+            bought = {N.norm(i["name"]) for i in fresh["recently"]}
+            wanted_flags = dict(flag_jobs)
+            for r in results:
+                key = N.norm(r["name"])
+                got = to_buy.get(key)
+                if operation == "TO_PURCHASE":
+                    r["on_list"] = got is not None
+                    if "specification" in r:
+                        r["spec_saved"] = got is not None and (got.get("specification") or "") == r["specification"]
+                    if r["name"] in wanted_flags:
+                        flags = wanted_flags[r["name"]]
+                        ok = got is not None and all(bool(got.get(k)) == v for k, v in flags.items())
+                        r["flags"] = {k: v for k, v in flags.items() if v} or "keine"
+                        r["flags_saved"] = ok
+                        if ok:
+                            self.attribute_type_verified = True
+                elif r["result"] != "stand nicht auf der Liste":
+                    r["verified"] = got is None and (operation == "REMOVE" or key in bought)
         return results
 
 
