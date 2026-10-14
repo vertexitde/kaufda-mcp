@@ -1,0 +1,27 @@
+[project]
+name = "kaufda-mcp"
+version = "0.1.0"
+description = "MCP Server für kaufDA: Angebote suchen, Prospekte ansehen und den Wocheneinkauf zusammenstellen"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26,<2",
+    "httpx>=0.27",
+    "tzdata>=2024.1",
+]
+
+keywords = ["mcp", "kaufda", "angebote", "prospekte", "einkaufsliste", "claude"]
+
+[project.urls]
+Repository = "https://github.com/vertexitde/kaufda-mcp"
+Issues = "https://github.com/vertexitde/kaufda-mcp/issues"
+
+[project.scripts]
+kaufda-mcp = "kaufda_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kaufda_mcp"]
