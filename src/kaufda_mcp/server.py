@@ -15,9 +15,10 @@ from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from . import normalize as N
+from .bring import BringClient, BringError, KeyringStore, LoginPage, login_sync
 from .client import KaufdaClient, KaufdaError, check_uuid
 from .prefs import PreferenceStore
 
@@ -57,11 +58,31 @@ page. Give the user the viewer_url so they can open the brochure page on kaufda.
 5. Product search is keyword based: use simple German product words ("Butter", "Hackfleisch", \
 "Kaffee Bohnen"). suggest_search_terms helps to find good terms. Results with category_match=false are \
 often only loosely related (e.g. "Butterkekse" for "Butter").
+6. Shopping list apps: ask once whether the user keeps a shopping list in an app (supported: Bring!) and save \
+it with set_preferences(shopping_list_app="bring"). Then call bring_connect and give the user the login_url: \
+they log in there themselves. NEVER ask for the Bring! password in chat. Afterwards bring_status lists their \
+lists; if there are several, ask which one and call bring_select_list. shopping_list then returns bring_items \
+(name + specification with store, price and validity); after the user agrees with the plan, add them with \
+bring_add_items.
 """
 
 mcp = FastMCP("kaufda", instructions=INSTRUCTIONS, log_level=os.environ.get("KAUFDA_MCP_LOGLEVEL", "WARNING").upper())
 client = KaufdaClient()
 prefs = PreferenceStore()
+bring = BringClient()
+
+
+def _bring_logged_in(session: dict[str, Any]) -> None:
+    """Login page callback (runs in the page's thread): keep the session tokens, never the password."""
+    try:
+        KeyringStore().save(session)
+    except BringError as exc:
+        log.warning("Bring! session only kept in memory: %s", exc)
+        session["source"] = "memory"
+    bring.adopt(session)
+
+
+login_page = LoginPage(on_success=_bring_logged_in)
 
 When = Literal["all", "now", "upcoming"]
 GERMANY_CENTER = {"label": "Deutschland", "lat": 51.1657, "lng": 10.4515}
@@ -290,9 +311,15 @@ async def get_preferences() -> str:
         "location": data.get("location"),
         "stores": data.get("stores") or [],
         "apps": data.get("apps") or [],
+        "shopping_list_app": data.get("shopping_list_app"),
+        "bring_list": (data.get("bring_list") or {}).get("name"),
         "max_distance_km": prefs.radius_km(),
         "file": str(prefs.path),
     }
+    if not data.get("shopping_list_app"):
+        out["hint_shopping_list"] = ("Unbekannt, ob der Nutzer eine Einkaufslisten App nutzt. Einmal fragen; "
+                                     "unterstützt wird Bring! (set_preferences(shopping_list_app='bring'), dann "
+                                     "bring_connect).")
     if not data.get("location"):
         out["hint"] = "Kein Standort gespeichert: Nutzer nach PLZ/Ort fragen und set_preferences(location=...) aufrufen."
     if not data.get("stores"):
@@ -318,6 +345,8 @@ async def set_preferences(
                     "'PAYBACK'] or ['alle']. [] = none. App prices count into your_price only for these.")] = None,
     add_apps: Annotated[list[str] | None, Field(description="Add apps/cards.")] = None,
     remove_apps: Annotated[list[str] | None, Field(description="Remove apps/cards.")] = None,
+    shopping_list_app: Annotated[Literal["bring", "keine"] | None, Field(
+        description="Shopping list app the user keeps their list in: 'bring' (Bring!) or 'keine'.")] = None,
 ) -> str:
     """Save where the user lives, where they like to shop and which retailer apps / loyalty cards they use.
     Persists across sessions."""
@@ -344,9 +373,15 @@ async def set_preferences(
         data["apps"] = merge(list(data.get("apps") or []), apps, add_apps, remove_apps)
     if max_distance_km is not None:
         data["max_distance_km"] = max(0.0, float(max_distance_km))
+    if shopping_list_app is not None:
+        data["shopping_list_app"] = shopping_list_app
     prefs.save(data)
-    return _dump(N.compact({"saved": True, "location": data.get("location"), "stores": data["stores"],
-                            "apps": data.get("apps"), "max_distance_km": prefs.radius_km()}))
+    out = N.compact({"saved": True, "location": data.get("location"), "stores": data["stores"],
+                     "apps": data.get("apps"), "shopping_list_app": data.get("shopping_list_app"),
+                     "max_distance_km": prefs.radius_km()})
+    if shopping_list_app == "bring" and not await bring.connected():
+        out["next_step"] = "bring_connect aufrufen und dem Nutzer den Login Link geben."
+    return _dump(out)
 
 
 @mcp.tool()
@@ -415,6 +450,24 @@ def _price_line(offer: dict[str, Any]) -> dict[str, Any]:
 
 def _slim(offer: dict[str, Any]) -> dict[str, Any]:
     return {k: offer[k] for k in _SLIM_KEYS if k in offer}
+
+
+def _bring_spec(offer: dict[str, Any]) -> str:
+    """Short note for the shopping list app: 'Meggle, Netto 0,99 €, bis Sa 17.10.'"""
+    price = _price_line(offer).get("price_text") or ""
+    if offer.get("valid_from") and not offer.get("valid_today"):
+        when = "ab " + N.fmt_day(date.fromisoformat(offer["valid_from"]))
+    elif offer.get("valid_until"):
+        when = "bis " + N.fmt_day(date.fromisoformat(offer["valid_until"]))
+    else:
+        when = ""
+    retailer = _SHORT_RETAILER.get(offer.get("retailer") or "", offer.get("retailer"))
+    parts = [offer.get("brand"), " ".join(x for x in (retailer, price) if x), when]
+    return ", ".join(p for p in parts if p)[:120]
+
+
+_SHORT_RETAILER = {"Netto Marken-Discount": "Netto", "Netto mit dem Scottie": "Netto Scottie",
+                   "dm-drogerie markt": "dm", "famila Nordost": "famila", "MediaMarkt Saturn": "MediaMarkt"}
 
 
 def _store_plan(picks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -502,6 +555,7 @@ async def shopping_list(
             "match": N.RELEVANCE_LABELS[N.relevance_tier(best, item)],
             "best": _slim(best),
             "alternatives": [_slim(o) for o in ranked[1:1 + alternatives]],
+            "_spec": _bring_spec(best),
         }))
         by_store.setdefault(best.get("retailer") or "?", []).append(N.compact({
             "item": item, "product": " ".join(x for x in (best.get("brand"), best.get("product")) if x),
@@ -510,6 +564,13 @@ async def shopping_list(
             "viewer_url": best.get("viewer_url"), "cutout_url": best.get("cutout_url"),
             "_from": best.get("valid_from"), "_until": best.get("valid_until"),
         }))
+    bring_items = None
+    if prefs.load().get("shopping_list_app") == "bring":
+        bring_items = [{"name": entry["item"], "specification": entry["_spec"]}
+                       for entry in per_item if entry.get("_spec")]
+        bring_items += [{"name": item} for item in missing]
+    for entry in per_item:
+        entry.pop("_spec", None)
     return _dump(N.compact({
         "location": loc.get("label"),
         "store_filter": scope,
@@ -519,6 +580,7 @@ async def shopping_list(
         "estimated_total_eur": round(total, 2),
         "not_found": missing,
         "items": per_item,
+        "bring_items": bring_items,
     }))
 
 
@@ -807,6 +869,168 @@ async def suggest_search_terms(
     return _dump([s.get("name") for s in suggestions if s.get("name")])
 
 
+# ====================================================================== Bring! shopping list
+
+class BringItemIn(BaseModel):
+    name: str = Field(description="Item as it should appear on the list, e.g. 'Butter', 'Hackfleisch'.")
+    specification: str | None = Field(
+        default=None, description="Short note under the item, e.g. 'Meggle, Netto 0,99 €, bis Sa 17.10.'.")
+
+
+async def _bring_list(list_name: str | None) -> dict[str, str]:
+    try:
+        lists = await bring.lists()
+    except BringError as exc:
+        raise ToolError(str(exc)) from exc
+    if not lists:
+        raise ToolError("In diesem Bring! Konto gibt es keine Liste.")
+    names = ", ".join(entry["name"] for entry in lists)
+    if list_name:
+        wanted = N.norm(list_name)
+        hits = ([e for e in lists if e["uuid"] == list_name or N.norm(e["name"]) == wanted]
+                or [e for e in lists if wanted and wanted in N.norm(e["name"])])
+        if not hits:
+            raise ToolError(f"Bring! Liste '{list_name}' nicht gefunden. Vorhanden: {names}")
+        return hits[0]
+    saved = (prefs.load().get("bring_list") or {}).get("uuid")
+    for entry in lists:
+        if entry["uuid"] == saved:
+            return entry
+    if len(lists) == 1:
+        return lists[0]
+    raise ToolError(f"Mehrere Bring! Listen vorhanden ({names}). Den Nutzer fragen und bring_select_list aufrufen.")
+
+
+@mcp.tool()
+async def bring_status() -> str:
+    """Is the user's Bring! account connected? Shows the account, the selected list and all lists."""
+    available, backend = KeyringStore.available()
+    try:
+        session = await bring.session()
+    except BringError:
+        return _dump(N.compact({
+            "connected": False,
+            "next_step": "bring_connect aufrufen und dem Nutzer den Login Link geben. Nie nach dem Passwort fragen.",
+            "secure_storage": backend if available else f"nicht verfügbar ({backend})",
+        }))
+    try:
+        lists = await bring.lists()
+    except BringError as exc:
+        raise ToolError(str(exc)) from exc
+    selected = prefs.load().get("bring_list") or {}
+    if not selected and len(lists) == 1:
+        selected = {"uuid": lists[0]["uuid"], "name": lists[0]["name"]}
+    out = {
+        "connected": True,
+        "account": session.get("email"),
+        "selected_list": selected.get("name"),
+        "lists": [entry["name"] for entry in lists],
+        "stored": {"env": "Umgebungsvariablen", "memory": "nur bis zum Neustart"}.get(
+            session.get("source") or "", "sicher im Schlüsselspeicher des Systems"),
+    }
+    if not selected.get("name"):
+        out["next_step"] = "Nutzer fragen, welche Liste genutzt werden soll, dann bring_select_list."
+    return _dump(N.compact(out))
+
+
+@mcp.tool()
+async def bring_connect() -> str:
+    """Start the Bring! login: returns a one-time link to a local login page (on this computer, valid 10 minutes).
+    Give the link to the user; they enter their Bring! mail and password there, directly. Their password never
+    passes through the chat and is not stored, only the session token (in the system keychain).
+    Never ask the user for the password yourself."""
+    if await bring.connected():
+        return _dump({"connected": True, "next_step": "Bereits verbunden, bring_status zeigt die Listen."})
+    available, backend = KeyringStore.available()
+    url = await asyncio.to_thread(login_page.start)
+    return _dump(N.compact({
+        "login_url": url,
+        "valid_minutes": 10,
+        "tell_user": ("Öffne den Link im Browser auf diesem Rechner, melde dich mit deinen Bring! Zugangsdaten an "
+                      "und sag mir danach kurz Bescheid."),
+        "secure_storage": backend if available else f"nicht verfügbar ({backend}): Sitzung gilt nur bis zum Neustart",
+        "alternatives": {
+            "terminal": "kaufda-mcp bring-login (fragt Mail und Passwort im Terminal ab)",
+            "server_or_bot": "Umgebungsvariablen BRING_EMAIL und BRING_PASSWORD für den MCP Server setzen",
+        },
+        "note": "Der Link funktioniert nur auf dem Rechner, auf dem der MCP Server läuft.",
+    }))
+
+
+@mcp.tool()
+async def bring_select_list(
+    list_name: Annotated[str, Field(description="Name (or uuid) of the Bring! list, e.g. 'Zuhause'.")],
+) -> str:
+    """Choose which Bring! list the shopping items go to (saved permanently)."""
+    entry = await _bring_list(list_name)
+    data = prefs.load()
+    data["bring_list"] = {"uuid": entry["uuid"], "name": entry["name"]}
+    data.setdefault("shopping_list_app", "bring")
+    prefs.save(data)
+    return _dump({"saved": True, "bring_list": entry["name"]})
+
+
+@mcp.tool()
+async def bring_get_list(
+    list_name: Annotated[str | None, Field(description="Other list than the selected one.")] = None,
+) -> str:
+    """Show what is currently on the user's Bring! list (to buy, plus recently bought)."""
+    entry = await _bring_list(list_name)
+    try:
+        items = await bring.items(entry["uuid"])
+    except BringError as exc:
+        raise ToolError(str(exc)) from exc
+    return _dump({
+        "list": entry["name"],
+        "to_buy": [N.compact({"name": i.get("name"), "specification": i.get("specification")})
+                   for i in items["purchase"]],
+        "recently_bought": [i.get("name") for i in items["recently"][:20]],
+    })
+
+
+@mcp.tool()
+async def bring_add_items(
+    items: Annotated[list[BringItemIn], Field(min_length=1, max_length=60,
+                                              description="Items to put on the list (existing ones get updated).")],
+    list_name: Annotated[str | None, Field(description="Other list than the selected one.")] = None,
+) -> str:
+    """Add items (with an optional note like store, price and validity) to the user's Bring! list.
+    Only call this after the user agreed. shopping_list returns ready-made bring_items."""
+    entry = await _bring_list(list_name)
+    try:
+        added = await bring.change(entry["uuid"], [i.model_dump() for i in items], "TO_PURCHASE")
+    except BringError as exc:
+        raise ToolError(str(exc)) from exc
+    return _dump({"list": entry["name"], "added_or_updated": added})
+
+
+@mcp.tool()
+async def bring_remove_items(
+    names: Annotated[list[str], Field(min_length=1, description="Item names to take off the list.")],
+    mark_as_bought: Annotated[bool, Field(
+        description="true = move to 'zuletzt gekauft' like ticking it off in the app, false = delete.")] = False,
+    list_name: Annotated[str | None, Field(description="Other list than the selected one.")] = None,
+) -> str:
+    """Remove items from the user's Bring! list or tick them off as bought."""
+    entry = await _bring_list(list_name)
+    try:
+        done = await bring.change(entry["uuid"], [{"name": n} for n in names],
+                                  "TO_RECENTLY" if mark_as_bought else "REMOVE")
+    except BringError as exc:
+        raise ToolError(str(exc)) from exc
+    return _dump({"list": entry["name"], "bought" if mark_as_bought else "removed": done})
+
+
+@mcp.tool()
+async def bring_disconnect() -> str:
+    """Disconnect Bring!: deletes the stored session token from this computer."""
+    bring.forget()
+    data = prefs.load()
+    data.pop("bring_list", None)
+    prefs.save(data)
+    return _dump({"disconnected": True})
+
+
 @mcp.prompt(name="wocheneinkauf", description="Wocheneinkauf anhand der aktuellen Prospekte planen")
 def wocheneinkauf(einkaufsliste: str, woche: str = "aktuelle Woche") -> str:
     return (
@@ -831,14 +1055,51 @@ def _version() -> str:
         return "unbekannt"
 
 
+def _bring_cli(command: str) -> int:
+    """Terminal helpers for Bring!, e.g. for servers without a browser."""
+    store = KeyringStore()
+    if command == "bring-logout":
+        store.delete()
+        print("Bring! Sitzung gelöscht.")
+        return 0
+    if command == "bring-login":
+        import getpass
+
+        available, backend = KeyringStore.available()
+        if not available:
+            print(f"Kein Schlüsselspeicher verfügbar ({backend}). Nutze BRING_EMAIL und BRING_PASSWORD.")
+            return 1
+        email = input("Bring! Mailadresse: ").strip()
+        password = getpass.getpass("Bring! Passwort (wird nicht gespeichert): ")
+        try:
+            session = login_sync(email, password)
+            store.save(session)
+        except BringError as exc:
+            print(f"Fehler: {exc}")
+            return 1
+        print(f"Verbunden als {session.get('email')}. Gespeichert im Schlüsselspeicher ({backend}).")
+    try:
+        lists = asyncio.run(BringClient(store).lists())
+    except BringError as exc:
+        print(f"Nicht verbunden: {exc}")
+        return 1
+    print("Bring! Listen: " + ", ".join(entry["name"] for entry in lists))
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="kaufda-mcp", description="kaufDA MCP server")
+    parser.add_argument("command", nargs="?", default="serve",
+                        choices=["serve", "bring-login", "bring-logout", "bring-status"],
+                        help="serve (Standard) startet den MCP Server; bring-login/-logout/-status verwalten Bring!")
     parser.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--version", action="version", version=f"%(prog)s {_version()}")
     args = parser.parse_args()
     logging.basicConfig(stream=sys.stderr, level=os.environ.get("KAUFDA_MCP_LOGLEVEL", "WARNING"))
+    if args.command != "serve":
+        sys.exit(_bring_cli(args.command))
     if args.transport != "stdio":
         mcp.settings.host = args.host
         mcp.settings.port = args.port
