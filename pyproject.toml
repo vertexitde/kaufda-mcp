@@ -1,6 +1,6 @@
 [project]
 name = "kaufda-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP Server für kaufDA: Angebote suchen, Prospekte ansehen und den Wocheneinkauf zusammenstellen"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,6 +8,7 @@ dependencies = [
     "mcp>=1.26,<2",
     "httpx>=0.27",
     "tzdata>=2024.1",
+    "pillow>=10",
 ]
 
 keywords = ["mcp", "kaufda", "angebote", "prospekte", "einkaufsliste", "claude"]

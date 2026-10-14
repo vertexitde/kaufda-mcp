@@ -9,7 +9,7 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 * **Kein Prospekte Blättern mehr:** Die KI durchsucht alle Prospekte in deiner Nähe in Sekunden.
 * **Richtige Gültigkeit pro Angebot:** Viele Angebote gelten erst ab Donnerstag, und Prospekte der nächsten Woche sind oft schon online. Jedes Angebot hat seinen eigenen Zeitraum und einen Status bezogen auf heute, z.B. `aktiv`, `aktiv, endet heute` oder `demnächst, ab morgen Do 15.10.`.
 * **Keine Preisfallen:** Preise, die nur mit App, Kundenkarte oder ab einer Mindestmenge gelten ("Nur mit App", "Mit Lidl Plus", "ab 2 Stück"), werden getrennt ausgewiesen und nicht als normaler Preis verkauft.
-* **Verifizierbar:** Die KI kann sich den Angebotsausschnitt oder die ganze Prospektseite als Bild ansehen und so Preis und Zeitraum selbst gegenprüfen. Zu jedem Treffer gibt es einen kaufDA Link auf die passende Seite.
+* **Verifizierbar:** Jedes Angebot hat eine `cutout_url` auf den Ausschnitt aus dem Prospekt (mit Preis, kein reines Produktfoto). Die KI kann sich Ausschnitt, Umgebung oder die ganze Prospektseite als Bild ansehen und so Preis und Zeitraum selbst gegenprüfen. Zu jedem Treffer gibt es einen kaufDA Link auf die passende Seite.
 * **Vergleichbar:** Grundpreise (€/kg, €/l) werden ausgewertet und, wo sie fehlen, aus der Packungsgröße geschätzt.
 * **Dein Profil bleibt gespeichert:** Standort, Lieblingsmärkte und Suchradius werden lokal gespeichert und gelten für jede weitere Unterhaltung.
 * **Einkaufsplanung:** Für jeden Markt wird berechnet, an welchen Tagen alle ausgewählten Angebote gleichzeitig gelten.
@@ -25,7 +25,7 @@ Du sagst der KI einmal, wo du wohnst und in welchen Märkten du einkaufst. Danac
 | `list_brochures` | Aktuelle und kommende Prospekte in der Nähe, mit nächster Filiale und Entfernung |
 | `get_brochure_offers` | Alle Angebote eines Prospekts, filterbar nach Suchbegriff oder Seite |
 | `view_brochure_page` | Prospektseite als Bild plus die erkannten Angebote dieser Seite |
-| `view_offer` | Angebotsausschnitt als Bild mit allen Details |
+| `view_offer` | Angebot als Bild aus dem Prospekt mit allen Details. `mode="context"` zeigt zusätzlich die Umgebung, falls Preis oder Datumsbanner abgeschnitten sind (bei Sammelangeboten die ganze Seite) |
 | `suggest_search_terms` | Vorschläge für passende Suchbegriffe |
 
 Zusätzlich gibt es den Prompt **`wocheneinkauf`**, der den kompletten Ablauf (Profil prüfen, Liste suchen, unsichere Treffer verifizieren, Ergebnis pro Markt) vorgibt.

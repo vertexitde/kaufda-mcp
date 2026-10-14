@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import logging
 import os
@@ -40,8 +41,10 @@ always say from which day it applies. If the user names a shopping day, pass val
 for shopping today use when="now". shopping_list returns a shopping_window per store (the days on which \
 all picks of that store are valid together). Offers with conditions ("Nur mit App", "Mit Lidl Plus", \
 "ab 2 Stück") or conditional_prices only apply under that condition.
-4. To verify an offer, call view_offer or view_brochure_page and look at the image. Give the user the \
-viewer_url so they can open the brochure page on kaufda.de.
+4. To show or verify an offer use its cutout_url (kaufDA's clipping from the brochure incl. price) or call \
+view_offer, which returns that clipping as an image (mode="context" adds the surroundings when the price or \
+a date banner is cut off). Never present any other picture as the offer. view_brochure_page shows the whole \
+page. Give the user the viewer_url so they can open the brochure page on kaufda.de.
 5. Product search is keyword based: use simple German product words ("Butter", "Hackfleisch", \
 "Kaffee Bohnen"). suggest_search_terms helps to find good terms. Results with category_match=false are \
 often only loosely related (e.g. "Butterkekse" for "Butter").
@@ -358,7 +361,8 @@ async def search_offers(
 _SLIM_KEYS = ("offer_id", "product", "brand", "description", "retailer", "price", "price_text", "unit_price",
               "unit_price_value",
               "conditions", "conditional_prices", "regular_price", "uvp", "validity", "status", "valid_today",
-              "starts_in_days", "valid_from", "valid_until", "brochure_id", "page", "viewer_url", "distance_km")
+              "starts_in_days", "valid_from", "valid_until", "brochure_id", "page", "viewer_url", "cutout_url",
+              "distance_km")
 
 
 def _slim(offer: dict[str, Any]) -> dict[str, Any]:
@@ -453,7 +457,7 @@ async def shopping_list(
             "item": item, "product": " ".join(x for x in (best.get("brand"), best.get("product")) if x),
             "price_text": best.get("price_text"), "conditions": best.get("conditions"),
             "validity": best.get("validity"), "status": best.get("status"), "page": best.get("page"),
-            "viewer_url": best.get("viewer_url"),
+            "viewer_url": best.get("viewer_url"), "cutout_url": best.get("cutout_url"),
             "_from": best.get("valid_from"), "_until": best.get("valid_until"),
         }))
     return _dump(N.compact({
@@ -651,7 +655,7 @@ async def view_brochure_page(
         o.pop("_categories", None)
         o.pop("retailer", None)
         o.pop("viewer_url", None)
-        o.pop("image_url", None)
+        o.pop("cutout_url", None)
     info = N.compact({
         "brochure_id": bid,
         "retailer": retailer,
@@ -665,14 +669,37 @@ async def view_brochure_page(
     return [Image(data=data, format="jpeg"), _dump(info)]
 
 
+def _crop_area(page_jpeg: bytes, area: dict[str, Any], margin: float) -> bytes:
+    """Cut the offer's area (normalized coordinates) plus a margin out of a brochure page."""
+    from PIL import Image as PILImage
+
+    with PILImage.open(io.BytesIO(page_jpeg)) as im:
+        width, height = im.size
+        top_left, bottom_right = area.get("topLeft") or {}, area.get("bottomRight") or {}
+        x0, y0 = float(top_left.get("x", 0)) * width, float(top_left.get("y", 0)) * height
+        x1, y1 = float(bottom_right.get("x", 1)) * width, float(bottom_right.get("y", 1)) * height
+        pad_x, pad_y = (x1 - x0) * margin, (y1 - y0) * margin
+        box = (max(0, int(x0 - pad_x)), max(0, int(y0 - pad_y)),
+               min(width, int(x1 + pad_x)), min(height, int(y1 + pad_y)))
+        crop = im.crop(box).convert("RGB")
+        crop.thumbnail((1200, 1200))
+        out = io.BytesIO()
+        crop.save(out, format="JPEG", quality=85)
+        return out.getvalue()
+
+
 @mcp.tool(structured_output=False)
 async def view_offer(
     offer_id: Annotated[str, Field(description="offer_id from search_offers / get_brochure_offers.")],
     brochure_id: Annotated[str, Field(description="brochure_id the offer belongs to.")],
+    mode: Annotated[Literal["cutout", "context"], Field(
+        description="'cutout' = kaufDA's clipping of the offer (usually incl. price). 'context' = the offer's area "
+                    "cut from the brochure page with a margin around it: use it when the price, a date banner or "
+                    "a condition is not visible in the cutout.")] = "cutout",
     location: LocationArg = None,
 ) -> list:
-    """Show the offer's cut-out from the brochure as an image plus all its details, to verify price,
-    conditions and validity."""
+    """Show the offer as it appears in the brochure (image incl. price) plus all its details, to verify price,
+    conditions and validity. This image (or cutout_url) is the proof for an offer; product photos are not."""
     try:
         oid = check_uuid(offer_id, "Angebots ID")
     except KaufdaError as exc:
@@ -685,16 +712,32 @@ async def view_offer(
             if (content.get("id") or "").lower() != oid:
                 continue
             offer = N.offer_from_viewer(content, retailer=retailer)
-            url = content.get("image")
-            if not url:
-                images = {img.get("size"): img.get("url") for img in page.get("images") or []}
-                url = images.get("768x1024")
+            area = ((content.get("parentContent") or {}).get("page") or {}).get("area")
+            images = {img.get("size"): img.get("url") for img in page.get("images") or []}
             blocks: list[Any] = []
-            if url:
-                try:
-                    blocks.append(Image(data=await client.image(url), format="jpeg"))
-                except KaufdaError as exc:
-                    offer["image_error"] = str(exc)
+            try:
+                tl, br = (area or {}).get("topLeft") or {}, (area or {}).get("bottomRight") or {}
+                share = (br.get("x", 1) - tl.get("x", 0)) * (br.get("y", 1) - tl.get("y", 0)) if area else 1.0
+                if mode == "context" and share < 0.03 and images.get("768x1024"):
+                    # Grouped offers ("Besen, Kehrset, Mopp ... ab 2.99") only mark the product photo,
+                    # the price sits in a shared text block somewhere on the page.
+                    blocks.append(Image(data=await client.image(images["768x1024"]), format="jpeg"))
+                    offer["image"] = ("ganze Prospektseite: Sammelangebot, der Preis steht vermutlich in einem "
+                                      "gemeinsamen Textblock")
+                elif mode == "context" and area and (images.get("1600x1600") or images.get("2800x2800")):
+                    page_jpeg = await client.image(images.get("1600x1600") or images["2800x2800"])
+                    blocks.append(Image(data=await asyncio.to_thread(_crop_area, page_jpeg, area, 0.35),
+                                        format="jpeg"))
+                    offer["image"] = "Ausschnitt der Prospektseite mit Rand um das Angebot"
+                elif offer.get("cutout_url"):
+                    blocks.append(Image(data=await client.image(offer["cutout_url"]), format="jpeg"))
+                    offer["image"] = ("kaufDA Ausschnitt aus dem Prospekt. Fehlt der Preis, mit mode='context' "
+                                      "erneut aufrufen.")
+                elif images.get("768x1024"):
+                    blocks.append(Image(data=await client.image(images["768x1024"]), format="jpeg"))
+                    offer["image"] = "ganze Prospektseite (kein Ausschnitt verfügbar)"
+            except (KaufdaError, OSError) as exc:
+                offer["image_error"] = str(exc)
             blocks.append(_dump(offer))
             return blocks
     raise ToolError(f"Angebot {oid} nicht in Prospekt {bid} gefunden.")
@@ -725,11 +768,21 @@ def wocheneinkauf(einkaufsliste: str, woche: str = "aktuelle Woche") -> str:
     )
 
 
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("kaufda-mcp")
+    except Exception:
+        return "unbekannt"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="kaufda-mcp", description="kaufDA MCP server")
     parser.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_version()}")
     args = parser.parse_args()
     logging.basicConfig(stream=sys.stderr, level=os.environ.get("KAUFDA_MCP_LOGLEVEL", "WARNING"))
     if args.transport != "stdio":

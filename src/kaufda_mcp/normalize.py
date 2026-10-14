@@ -12,6 +12,8 @@ BERLIN = ZoneInfo("Europe/Berlin")
 WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 
 VIEWER_URL = "https://www.kaufda.de/contentViewer/static/{bid}?page={page}"
+# kaufDA's clipping of an offer from the brochure page (with price), keyed by offer id.
+CUTOUT_URL = "https://content-media.bonial.biz/{oid}/main.jpg"
 
 # Publishers that show up in search results but are not shops.
 IGNORED_PUBLISHERS = {"rezepte"}
@@ -372,7 +374,6 @@ def offer_from_search(item: dict[str, Any], brochure: dict[str, Any] | None,
         item.get("validFrom") or brochure.get("validFrom"),
         item.get("validUntil") or brochure.get("validUntil"),
     )
-    images = (item.get("offerImages") or {}).get("url") or {}
     paths = item.get("categoryPaths") or []
     out = {
         "offer_id": item.get("id"),
@@ -392,7 +393,7 @@ def offer_from_search(item: dict[str, Any], brochure: dict[str, Any] | None,
         "brochure_title": brochure.get("title"),
         "page": page,
         "viewer_url": viewer_url(bid, page) if bid else None,
-        "image_url": images.get("large") or images.get("normal"),
+        "cutout_url": CUTOUT_URL.format(oid=item["id"]) if item.get("id") else None,
         "distance_km": round(float(brochure["distance"]), 1) if brochure.get("distance") is not None else None,
         "category_match": _path_has(paths, category_ids) if category_ids else None,
     }
@@ -491,7 +492,7 @@ def offer_from_viewer(content: dict[str, Any], *, retailer: str | None = None,
         "brochure_id": bid,
         "page": page,
         "viewer_url": viewer_url(bid, page) if bid else None,
-        "image_url": content.get("image"),
+        "cutout_url": content.get("image") or (CUTOUT_URL.format(oid=content["id"]) if content.get("id") else None),
     }
     out = compact(out)
     estimate_unit_price(out)
