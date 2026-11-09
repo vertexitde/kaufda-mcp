@@ -76,7 +76,7 @@ uvx --from git+https://github.com/vertexitde/kaufda-mcp kaufda-mcp --transport s
 | `KAUFDA_LOCATION` | Standard Standort (PLZ oder Ort), solange keiner gespeichert ist |
 | `KAUFDA_MCP_PREFS` | Pfad zur Einstellungsdatei (Standard: `%APPDATA%\kaufda-mcp\preferences.json` bzw. `~/.config/kaufda-mcp/preferences.json`) |
 | `KAUFDA_MCP_LOGLEVEL` | Log Level auf stderr (Standard `WARNING`) |
-| `BRING_EMAIL`, `BRING_PASSWORD` | Bring! Zugang für Server ohne Schlüsselspeicher (sonst `bring-login` nutzen) |
+| `BRING_EMAIL`, `BRING_PASSWORD` | Bring! Zugang fest vorgeben, hat Vorrang vor dem gemerkten Login (sonst einmal `bring-login` nutzen) |
 
 ## Bring! Einkaufsliste
 
@@ -84,7 +84,7 @@ Die KI fragt einmal, ob du eine Einkaufslisten App nutzt. Sagst du *"Ja, Bring!"
 
 1. Die KI ruft `bring_connect` auf und gibt dir einen Link wie `http://127.0.0.1:12713/...`. Das ist eine kleine Login Seite, die nur auf deinem Rechner läuft und nach 10 Minuten bzw. nach dem Login wieder verschwindet.
 2. Dort meldest du dich mit deinen Bring! Zugangsdaten an. **Die KI sieht dein Passwort nie**, es geht direkt an Bring!.
-3. Gespeichert wird nur das Sitzungstoken von Bring!, nicht dein Passwort, und zwar im Schlüsselspeicher deines Systems (Windows Anmeldeinformationsverwaltung, macOS Schlüsselbund, Secret Service unter Linux). Abgelaufene Tokens werden automatisch erneuert.
+3. Mail, Passwort (abwählbar) und das Sitzungstoken werden dauerhaft gemerkt, siehe unten. Abgelaufene Tokens werden automatisch erneuert, und ist auch das nicht mehr möglich, meldet sich der Server selbst wieder an. Du musst dich also nur einmal einloggen.
 4. Hast du mehrere Listen, fragt die KI, welche sie nutzen soll.
 5. Nach jeder Einkaufsplanung fragt die KI dich direkt nach deiner Wahl und trägt erst nach deinem OK ein: nur der Markt als Beschreibung, deine eigene Mengenangabe bleibt davor stehen.
 
@@ -96,7 +96,18 @@ Die Markierungen (Dringend, Wenn's passt, Im Angebot) sind in keiner öffentlich
 uvx --from git+https://github.com/vertexitde/kaufda-mcp kaufda-mcp bring-login
 ```
 
-fragt Mail und Passwort im Terminal ab (`bring-status` zeigt die Listen, `bring-logout` löscht die Sitzung). Alternativ die Umgebungsvariablen `BRING_EMAIL` und `BRING_PASSWORD` für den MCP Server setzen.
+fragt einmal Mail und Passwort im Terminal ab (`bring-status` zeigt Listen und Speicherort, `bring-logout` löscht alles wieder). Alternativ die Umgebungsvariablen `BRING_EMAIL` und `BRING_PASSWORD` für den MCP Server setzen.
+
+**Wo die Zugangsdaten liegen:**
+
+| System | Speicherort |
+| --- | --- |
+| Windows | Windows Anmeldeinformationsverwaltung |
+| macOS | Schlüsselbund |
+| Linux mit entsperrtem Schlüsselbund | Secret Service (GNOME Schlüsselbund, KWallet) |
+| Debian/Ubuntu Server, WSL, Docker | `~/.config/kaufda-mcp/bring-credentials.json`, Dateirechte 600 |
+
+Auf Linux ohne Schlüsselbund gibt es keinen Speicher, der das Passwort verschlüsseln könnte, ohne dass du bei jedem Start etwas eingeben musst. Die Datei ist deshalb nicht verschlüsselt, sondern wie `~/.netrc` nur für deinen Benutzer und root lesbar. Wenn dir das nicht passt, entferne beim Login den Haken bei "Merken", dann bleibt nur das Sitzungstoken. Bei Docker muss der Ordner auf einem Volume liegen (Pfad über `KAUFDA_MCP_PREFS`), sonst ist er nach einem neuen Container weg.
 
 Bring! bietet keine offizielle API. Genutzt werden die Endpunkte der Bring! Apps, wie sie von der Community dokumentiert sind (u.a. [bring-api](https://github.com/miaucl/bring-api), das auch Home Assistant verwendet).
 

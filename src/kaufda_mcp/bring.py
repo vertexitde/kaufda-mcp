@@ -1,8 +1,9 @@
 """Bring! shopping list integration.
 
 Bring! has no public API. These are the endpoints the Bring! apps use, as documented by the community
-(https://github.com/miaucl/bring-api, used by Home Assistant). The password is only used once to log in;
-afterwards only the session tokens are kept, in the operating system's keychain.
+(https://github.com/miaucl/bring-api, used by Home Assistant). Session tokens and, if the user agrees, mail and
+password are kept in the operating system's keychain; where none works (headless Linux) in a file only the user
+can read. Credentials never pass through the chat.
 """
 
 from __future__ import annotations
@@ -16,12 +17,14 @@ import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs
 
 import httpx
 
 from . import normalize as N
+from .prefs import default_path
 
 log = logging.getLogger("kaufda_mcp")
 
@@ -38,7 +41,10 @@ CATALOG_LOCALE = "de-CH"  # Bring! stores catalog items under their de-CH name
 FLAG_KEYS = ("urgent", "convenient", "discounted")
 DEFAULT_ATTRIBUTE_TYPE = "PURCH_CONDITIONS"  # best guess, replaced by the type seen on the user's own items
 KEYRING_SERVICE = "kaufda-mcp"
-KEYRING_ACCOUNT = "bring-session"
+SESSION_KEY = "bring-session"
+LOGIN_KEY = "bring-login"
+KEYRING_CHUNK = 1000  # Windows Credential Manager takes at most 1280 characters per entry, tokens are longer
+KEYRING_TIMEOUT = 5.0  # a locked Linux keyring can wait forever for an unlock prompt nobody sees
 
 
 class BringError(RuntimeError):
@@ -51,58 +57,213 @@ class BringAuthError(BringError):
 
 # ---------------------------------------------------------------- credential storage
 
-class KeyringStore:
-    """Session tokens in the OS keychain (Windows Credential Manager, macOS Keychain, Secret Service)."""
+class KeyringBackend:
+    """OS keychain (Windows Credential Manager, macOS Keychain, Secret Service). Values are split into chunks."""
+
+    _NAMES = {"Windows": "Windows Anmeldeinformationsverwaltung", "macOS": "macOS Schlüsselbund",
+              "SecretService": "Secret Service Schlüsselbund", "kwallet": "KWallet"}
+
+    def __init__(self) -> None:
+        self._hung = False
+
+    def _call(self, func: Callable[..., Any], *args: Any) -> Any:
+        if self._hung:
+            raise TimeoutError("Schlüsselspeicher antwortet nicht")
+        result: list[tuple[bool, Any]] = []
+
+        def run() -> None:
+            try:
+                result.append((True, func(*args)))
+            except Exception as exc:
+                result.append((False, exc))
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(KEYRING_TIMEOUT)
+        if not result:
+            self._hung = True
+            raise TimeoutError("Schlüsselspeicher antwortet nicht")
+        ok, value = result[0]
+        if not ok:
+            raise value
+        return value
+
+    def _keyring(self) -> Any:
+        import keyring
+        from keyring.backends import fail, null
+
+        if isinstance(self._call(keyring.get_keyring), (fail.Keyring, null.Keyring)):
+            raise RuntimeError("kein Schlüsselspeicher vorhanden")
+        return keyring
+
+    def usable(self) -> bool:
+        try:
+            self._keyring()
+            return True
+        except Exception:
+            return False
+
+    def describe(self) -> str:
+        import keyring
+
+        name = type(keyring.get_keyring()).__module__.split(".")[-1]
+        return self._NAMES.get(name, f"{name} Schlüsselspeicher")
+
+    def _chunk_count(self, keyring: Any, name: str) -> int:
+        header = self._call(keyring.get_password, KEYRING_SERVICE, name)
+        try:
+            meta = json.loads(header) if header else None
+        except ValueError:
+            return 0
+        return int(meta["chunks"]) if isinstance(meta, dict) and "chunks" in meta else 0
+
+    def read(self, name: str) -> str | None:
+        keyring = self._keyring()
+        header = self._call(keyring.get_password, KEYRING_SERVICE, name)
+        count = self._chunk_count(keyring, name)
+        if not count:
+            return header  # single entry written by older versions
+        parts = [self._call(keyring.get_password, KEYRING_SERVICE, f"{name}.{i}") for i in range(count)]
+        return "".join(parts) if all(p is not None for p in parts) else None
+
+    def write(self, name: str, text: str) -> None:
+        keyring = self._keyring()
+        old = self._chunk_count(keyring, name)
+        chunks = [text[i:i + KEYRING_CHUNK] for i in range(0, len(text), KEYRING_CHUNK)] or [""]
+        for i, chunk in enumerate(chunks):
+            self._call(keyring.set_password, KEYRING_SERVICE, f"{name}.{i}", chunk)
+        self._call(keyring.set_password, KEYRING_SERVICE, name, json.dumps({"chunks": len(chunks)}))
+        for i in range(len(chunks), old):
+            self._remove(keyring, f"{name}.{i}")
+
+    def _remove(self, keyring: Any, account: str) -> None:
+        try:
+            self._call(keyring.delete_password, KEYRING_SERVICE, account)
+        except Exception:
+            pass  # already gone
+
+    def delete(self, name: str) -> None:
+        keyring = self._keyring()
+        for i in range(self._chunk_count(keyring, name)):
+            self._remove(keyring, f"{name}.{i}")
+        self._remove(keyring, name)
+
+
+class FileBackend:
+    """Fallback without a keychain (headless Debian/Ubuntu): a file only the user can read, like ~/.netrc.
+    Not encrypted. It sits next to preferences.json, so KAUFDA_MCP_PREFS moves it too (e.g. onto a Docker volume)."""
+
+    def __init__(self, path: Path | None = None):
+        self.path = path or default_path().parent / "bring-credentials.json"
+
+    def usable(self) -> bool:
+        return True
+
+    def describe(self) -> str:
+        return f"Datei {self.path} (nur dein Benutzer kann sie lesen)"
+
+    def _load(self) -> dict[str, str]:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _dump(self, data: dict[str, str]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)  # never readable by others, not even briefly
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        os.replace(tmp, self.path)
+
+    def read(self, name: str) -> str | None:
+        return self._load().get(name)
+
+    def write(self, name: str, text: str) -> None:
+        self._dump({**self._load(), name: text})
+
+    def delete(self, name: str) -> None:
+        data = self._load()
+        if name not in data:
+            return
+        del data[name]
+        if data:
+            self._dump(data)
+        else:
+            self.path.unlink(missing_ok=True)
+
+
+class CredentialStore:
+    """Bring! session tokens and saved login: keychain where one really works, otherwise the file."""
+
+    def __init__(self, backends: list[Any] | None = None):
+        self.backends = backends if backends is not None else [KeyringBackend(), FileBackend()]
+        self._used: Any = None
+
+    def _read(self, name: str) -> dict[str, Any] | None:
+        for backend in self.backends:
+            try:
+                text = backend.read(name)
+                if text is not None:
+                    self._used = backend
+                    return json.loads(text)
+            except Exception as exc:
+                log.info("credential backend %s: %s", type(backend).__name__, exc)
+        return None
+
+    def _write(self, name: str, value: dict[str, Any]) -> None:
+        text = json.dumps(value)
+        errors = []
+        for backend in self.backends:
+            try:
+                backend.write(name, text)
+                if backend.read(name) != text:  # some backends accept writes and keep nothing
+                    raise RuntimeError("Wert kam beim Zurücklesen nicht an")
+            except Exception as exc:
+                errors.append(f"{type(backend).__name__}: {exc}")
+                continue
+            self._used = backend
+            self._delete(name, skip=backend)  # no stale copy may shadow this one
+            return
+        raise BringError("Zugangsdaten konnten nirgends gespeichert werden: " + "; ".join(errors))
+
+    def _delete(self, name: str, skip: Any = None) -> None:
+        for backend in self.backends:
+            if backend is not skip:
+                try:
+                    backend.delete(name)
+                except Exception as exc:
+                    log.info("credential backend %s: %s", type(backend).__name__, exc)
 
     def load(self) -> dict[str, Any] | None:
-        try:
-            import keyring
-
-            raw = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        except Exception as exc:  # no backend, locked keychain ...
-            log.warning("keyring not available: %s", exc)
-            return None
-        try:
-            return json.loads(raw) if raw else None
-        except json.JSONDecodeError:
-            return None
+        return self._read(SESSION_KEY)
 
     def save(self, session: dict[str, Any]) -> None:
-        try:
-            import keyring
-
-            keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, json.dumps(session))
-        except Exception as exc:
-            raise BringError(
-                f"Kein sicherer Schlüsselspeicher verfügbar ({exc}). Auf Servern stattdessen BRING_EMAIL und "
-                "BRING_PASSWORD als Umgebungsvariablen setzen."
-            ) from exc
+        self._write(SESSION_KEY, session)
 
     def delete(self) -> None:
-        try:
-            import keyring
+        self._delete(SESSION_KEY)
 
-            keyring.delete_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
-        except Exception:
-            pass
+    def load_login(self) -> dict[str, Any] | None:
+        return self._read(LOGIN_KEY)
 
-    @staticmethod
-    def available() -> tuple[bool, str]:
-        try:
-            import keyring
-            from keyring.backends import fail
+    def save_login(self, email: str, password: str) -> None:
+        self._write(LOGIN_KEY, {"email": email.strip(), "password": password})
 
-            backend = keyring.get_keyring()
-            if isinstance(backend, fail.Keyring):
-                return False, "kein Schlüsselspeicher gefunden"
-            return True, type(backend).__module__.split(".")[-1]
-        except Exception as exc:
-            return False, str(exc)
+    def delete_login(self) -> None:
+        self._delete(LOGIN_KEY)
+
+    def describe(self) -> str:
+        backend = self._used or next((b for b in self.backends if b.usable()), None)
+        return backend.describe() if backend else "nirgends"
 
 
 class MemoryStore:
     def __init__(self) -> None:
         self.data: dict[str, Any] | None = None
+        self.login: dict[str, Any] | None = None
 
     def load(self) -> dict[str, Any] | None:
         return self.data
@@ -112,6 +273,18 @@ class MemoryStore:
 
     def delete(self) -> None:
         self.data = None
+
+    def load_login(self) -> dict[str, Any] | None:
+        return self.login
+
+    def save_login(self, email: str, password: str) -> None:
+        self.login = {"email": email.strip(), "password": password}
+
+    def delete_login(self) -> None:
+        self.login = None
+
+    def describe(self) -> str:
+        return "Arbeitsspeicher"
 
 
 # ---------------------------------------------------------------- client
@@ -147,7 +320,7 @@ def login_sync(email: str, password: str, transport: httpx.BaseTransport | None 
 
 class BringClient:
     def __init__(self, store: Any | None = None, transport: httpx.AsyncBaseTransport | None = None):
-        self.store = store or KeyringStore()
+        self.store = store or CredentialStore()
         self._transport = transport
         self._http = httpx.AsyncClient(base_url=BRING_API, timeout=20, headers=BRING_HEADERS, transport=transport)
         self._session: dict[str, Any] | None = None
@@ -164,23 +337,52 @@ class BringClient:
         self._session = dict(session)
         self._list_locales = None
 
-    def forget(self) -> None:
+    def _drop_session(self) -> None:
         self.store.delete()
         self._session = None
         self._list_locales = None
 
-    @staticmethod
-    def _env_credentials() -> tuple[str, str] | None:
-        email, password = os.environ.get("BRING_EMAIL"), os.environ.get("BRING_PASSWORD")
-        return (email, password) if email and password else None
+    def forget(self) -> None:
+        """Full disconnect: session and saved login are gone from this computer."""
+        self._drop_session()
+        self.store.delete_login()
 
-    async def _login_env(self) -> dict[str, Any]:
-        creds = self._env_credentials()
-        if not creds:
+    def _saved_login(self) -> tuple[str, str, str] | None:
+        email, password = os.environ.get("BRING_EMAIL"), os.environ.get("BRING_PASSWORD")
+        if email and password:
+            return email, password, "env"
+        stored = self.store.load_login() or {}
+        if stored.get("email") and stored.get("password"):
+            return stored["email"], stored["password"], "stored"
+        return None
+
+    def _persist(self, session: dict[str, Any]) -> None:
+        if session.get("source") == "env":
+            return
+        try:
+            self.store.save(session)
+            session.pop("source", None)
+        except BringError as exc:
+            log.warning("Bring! session only kept in memory: %s", exc)
+            session["source"] = "memory"
+
+    async def _login(self) -> dict[str, Any]:
+        """Log in without the user: BRING_EMAIL/BRING_PASSWORD or the saved login."""
+        login = self._saved_login()
+        if not login:
             raise BringAuthError("Nicht mit Bring! verbunden. bring_connect aufrufen.")
-        resp = await self._http.post("/v2/bringauth", data={"email": creds[0], "password": creds[1]})
-        session = _session_from_auth(resp, creds[0])
-        session["source"] = "env"
+        email, password, source = login
+        try:
+            resp = await self._http.post("/v2/bringauth", data={"email": email, "password": password})
+        except httpx.HTTPError as exc:
+            raise BringError(f"Bring! nicht erreichbar: {exc}") from exc
+        if resp.status_code == 401 and source == "stored":
+            self.store.delete_login()  # do not keep hammering Bring! with a dead password
+            raise BringAuthError("Das gespeicherte Bring! Passwort stimmt nicht mehr. Bitte neu verbinden (bring_connect).")
+        session = _session_from_auth(resp, email)
+        if source == "env":
+            session["source"] = "env"
+        self._persist(session)
         return session
 
     def _auth_headers(self, session: dict[str, Any]) -> dict[str, str]:
@@ -192,11 +394,14 @@ class BringClient:
 
     async def _refresh(self, session: dict[str, Any]) -> dict[str, Any]:
         if session.get("refresh_token"):
-            resp = await self._http.post(
-                "/v2/bringauth/token",
-                data={"grant_type": "refresh_token", "refresh_token": session["refresh_token"]},
-                headers=self._auth_headers(session),
-            )
+            try:
+                resp = await self._http.post(
+                    "/v2/bringauth/token",
+                    data={"grant_type": "refresh_token", "refresh_token": session["refresh_token"]},
+                    headers=self._auth_headers(session),
+                )
+            except httpx.HTTPError as exc:
+                raise BringError(f"Bring! nicht erreichbar: {exc}") from exc
             if resp.status_code == 200:
                 data = resp.json()
                 session.update(
@@ -205,12 +410,13 @@ class BringClient:
                     refresh_token=data.get("refresh_token") or session["refresh_token"],
                     expires_at=time.time() + int(data.get("expires_in") or 3600) - 60,
                 )
-                if session.get("source") != "env":
-                    self.store.save(session)
+                self._persist(session)
                 return session
-        if self._env_credentials():
-            return await self._login_env()
-        self.forget()
+            if resp.status_code not in (400, 401, 403):  # Bring! hiccup: the session is still fine
+                raise BringError(f"Bring! Token Erneuerung fehlgeschlagen (HTTP {resp.status_code}).")
+        self._drop_session()
+        if self._saved_login():
+            return await self._login()
         raise BringAuthError("Bring! Sitzung abgelaufen. Bitte neu verbinden (bring_connect).")
 
     async def session(self, *, force_refresh: bool = False) -> dict[str, Any]:
@@ -218,7 +424,7 @@ class BringClient:
             if self._session is None:
                 self._session = self.store.load()
             if self._session is None:
-                self._session = await self._login_env()
+                self._session = await self._login()
             if force_refresh or self._session.get("expires_at", 0) < time.time():
                 self._session = await self._refresh(self._session)
             return self._session
@@ -227,8 +433,13 @@ class BringClient:
         try:
             await self.session()
             return True
-        except BringError:
+        except BringAuthError:
             return False
+        except BringError:
+            return True  # Bring! briefly unreachable, the login itself is fine
+
+    def can_auto_login(self) -> bool:
+        return self._saved_login() is not None
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         session = await self.session()
@@ -433,18 +644,20 @@ button{{margin-top:18px;width:100%;padding:11px;border:0;border-radius:8px;backg
 </style></head><body><div class="card">{body}</div></body></html>"""
 
 _FORM = """<h1>Bring! mit kaufDA verbinden</h1>
-<p>Deine Zugangsdaten gehen direkt an Bring!. Die KI sieht sie nicht. Gespeichert wird nur ein Sitzungstoken
-im Schlüsselspeicher deines Systems, nicht dein Passwort.</p>{error}
+<p>Deine Zugangsdaten gehen direkt an Bring!. Die KI sieht sie nicht. Gemerkt werden sie im Schlüsselspeicher
+deines Systems, ohne Schlüsselspeicher (Linux Server) in einer Datei, die nur dein Benutzer lesen kann.</p>{error}
 <form method="post" autocomplete="on">
 <label for="email">Mailadresse</label><input id="email" name="email" type="email" required autofocus>
 <label for="password">Passwort</label><input id="password" name="password" type="password" required>
+<label style="display:flex;gap:8px;align-items:center"><input style="width:auto" name="remember" type="checkbox" checked>
+Merken, dann muss ich mich nicht nochmal anmelden</label>
 <button type="submit">Verbinden</button></form>"""
 
 
 class LoginPage:
     """One-time login form on 127.0.0.1 with an unguessable path; closes after success or timeout."""
 
-    def __init__(self, on_success: Callable[[dict[str, Any]], None],
+    def __init__(self, on_success: Callable[[dict[str, Any], str, str, bool], None],
                  login: Callable[[str, str], dict[str, Any]] = login_sync, ttl_seconds: int = 600):
         self._on_success = on_success
         self._login = login
@@ -495,7 +708,7 @@ class LoginPage:
                 password = (form.get("password") or [""])[0]
                 try:
                     session = page._login(email, password)
-                    page._on_success(session)
+                    page._on_success(session, email, password, "remember" in form)
                 except BringError as exc:
                     return self._send(200, _FORM.format(error=f'<p class="err">{html.escape(str(exc))}</p>'))
                 page.done.set()

@@ -1,14 +1,23 @@
 """Offline tests for the Bring! integration against a simulated, stateful Bring! API.
 Run: uv run python tests/test_bring.py"""
 import asyncio
+import contextlib
 import json
+import os
+import stat
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 
 import httpx
+import keyring
+import keyring.backend
+import keyring.errors
+from keyring.backends import fail, null
 
 from kaufda_mcp import bring as B
 
@@ -42,6 +51,8 @@ def handler(request: httpx.Request) -> httpx.Response:
                                          "access_token": "tok-1", "refresh_token": "ref-1", "token_type": "Bearer",
                                          "expires_in": 604800})
     if path == "/rest/v2/bringauth/token":
+        if STATE.get("token_status"):
+            return httpx.Response(STATE["token_status"])
         if urllib.parse.parse_qs(body).get("refresh_token") != [STATE["refresh"]]:
             return httpx.Response(401, json={"message": "invalid refresh token"})
         STATE["n"] += 1
@@ -179,7 +190,11 @@ def _post(url, data, host=None):
 def test_login_page():
     reset()
     received = {}
-    page = B.LoginPage(on_success=received.update,
+
+    def on_success(session, email, password, remember):
+        received.update(session, form=(email, password, remember))
+
+    page = B.LoginPage(on_success=on_success,
                        login=lambda e, p: B.login_sync(e, p, transport=httpx.MockTransport(handler)), ttl_seconds=30)
     url = page.start()
     assert url.startswith("http://127.0.0.1:") and len(url.rsplit("/", 1)[1]) >= 30
@@ -199,14 +214,174 @@ def test_login_page():
         assert exc.code == 404
     status, body = _post(url, {"email": "a@b.de", "password": "falsch"})
     assert status == 200 and "fehlgeschlagen" in body and not received
-    status, body = _post(url, {"email": "a@b.de", "password": "richtig"})
-    assert "Verbunden" in body and received["uuid"] == "U1" and "password" not in received
+    status, body = _post(url, {"email": "a@b.de", "password": "richtig", "remember": "on"})
+    assert "Verbunden" in body and received["uuid"] == "U1" and received["form"] == ("a@b.de", "richtig", True)
     time.sleep(0.5)
     try:
         urllib.request.urlopen(url, timeout=2)
         raise AssertionError("page still open after login")
     except (urllib.error.URLError, ConnectionError):
         pass
+    url = page.start()  # unticked box: not remembered
+    _post(url, {"email": "a@b.de", "password": "richtig"})
+    assert received["form"] == ("a@b.de", "richtig", False)
+    page.stop()
+
+
+# ---------------------------------------------------------------- storage
+
+
+class LimitedKeyring(keyring.backend.KeyringBackend):
+    """Behaves like Windows Credential Manager: at most 1280 characters per entry."""
+
+    priority = 1
+
+    def __init__(self):
+        super().__init__()
+        self.data = {}
+
+    def get_password(self, service, username):
+        return self.data.get((service, username))
+
+    def set_password(self, service, username, password):
+        if len(password) > 1280:
+            raise OSError("1783 CredWrite")
+        self.data[(service, username)] = password
+
+    def delete_password(self, service, username):
+        if (service, username) not in self.data:
+            raise keyring.errors.PasswordDeleteError(username)
+        del self.data[(service, username)]
+
+
+class LockedKeyring(LimitedKeyring):
+    """Secret Service present but locked: reading works, writing fails."""
+
+    def set_password(self, service, username, password):
+        raise keyring.errors.KeyringLocked("locked")
+
+
+@contextlib.contextmanager
+def using_keyring(backend):
+    before = keyring.get_keyring()
+    keyring.set_keyring(backend)
+    try:
+        yield backend
+    finally:
+        keyring.set_keyring(before)
+
+
+def _token_session(size=3000):
+    return {"email": "a@b.de", "uuid": "U1", "access_token": "a" * size, "refresh_token": "r" * size,
+            "token_type": "Bearer", "expires_at": time.time() + 3600}
+
+
+def test_long_tokens_fit_into_a_limited_keychain():
+    with using_keyring(LimitedKeyring()) as fake:
+        store = B.CredentialStore([B.KeyringBackend()])
+        session = _token_session()
+        store.save(session)
+        assert store.load() == session and max(len(v) for v in fake.data.values()) <= 1280
+        many = len(fake.data)
+        store.save(_token_session(10))  # shorter value must not leave old chunks behind
+        assert len(fake.data) < many and store.load()["access_token"] == "a" * 10
+        store.save_login("a@b.de", "pässwörd!")
+        assert store.load_login() == {"email": "a@b.de", "password": "pässwörd!"}
+        store.delete()
+        store.delete_login()
+        assert fake.data == {}
+        fake.data[(B.KEYRING_SERVICE, B.SESSION_KEY)] = json.dumps({"uuid": "alt"})  # format of older versions
+        assert store.load() == {"uuid": "alt"}
+
+
+def _file_store(directory):
+    return B.CredentialStore([B.KeyringBackend(), B.FileBackend(Path(directory) / "bring-credentials.json")])
+
+
+def test_linux_without_keychain_uses_private_file():
+    with tempfile.TemporaryDirectory() as tmp, using_keyring(fail.Keyring()):
+        store = _file_store(tmp)
+        store.save(_token_session())
+        store.save_login("a@b.de", "richtig")
+        path = Path(tmp) / "bring-credentials.json"
+        assert "Datei" in store.describe() and path.exists() and not list(Path(tmp).glob("*.tmp"))
+        if os.name == "posix":
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        again = _file_store(tmp)  # restart
+        assert again.load()["uuid"] == "U1" and again.load_login()["password"] == "richtig"
+        again.delete()
+        again.delete_login()
+        assert not path.exists()
+
+
+def test_keychains_that_do_not_store_fall_back_to_file():
+    for backend in (null.Keyring(), LockedKeyring()):
+        with tempfile.TemporaryDirectory() as tmp, using_keyring(backend):
+            store = _file_store(tmp)
+            store.save_login("a@b.de", "richtig")
+            assert _file_store(tmp).load_login()["password"] == "richtig", type(backend).__name__
+            assert "Datei" in store.describe()
+
+
+async def _restart_flow():
+    reset()
+    with tempfile.TemporaryDirectory() as tmp, using_keyring(fail.Keyring()):
+        store = _file_store(tmp)
+        store.save(B.login_sync("a@b.de", "richtig", transport=httpx.MockTransport(handler)))
+        CALLS.clear()
+        assert len(await B.BringClient(_file_store(tmp), transport=httpx.MockTransport(handler)).lists()) == 2
+        assert not [c for c in CALLS if c[1] == "/rest/v2/bringauth"]  # restart without a new login
+
+
+def test_restart_needs_no_login():
+    asyncio.run(_restart_flow())
+
+
+async def _saved_login_flow():
+    reset()
+    store, client = _client()
+    store.save_login("a@b.de", "richtig")
+    store.data["expires_at"] = time.time() - 10
+    STATE["refresh"] = "ungültig"  # refresh token dead -> logs in again on its own
+    assert len(await client.lists()) == 2 and client.can_auto_login()
+    assert store.data["access_token"] == "tok-1" and "richtig" not in json.dumps(store.data)
+
+    reset()  # nothing stored at all except the login, e.g. first start after an update
+    store, client = _client()
+    store.save_login("a@b.de", "richtig")
+    store.delete()
+    assert len(await client.lists()) == 2 and store.data
+
+    reset()  # password changed at Bring!
+    store, client = _client()
+    store.save_login("a@b.de", "falsch")
+    store.delete()
+    try:
+        await client.lists()
+        raise AssertionError("wrong saved password accepted")
+    except B.BringAuthError as exc:
+        assert "stimmt nicht mehr" in str(exc) and store.login is None
+
+    reset()  # Bring! hiccup must not throw anything away
+    store, client = _client()
+    store.save_login("a@b.de", "richtig")
+    store.data["expires_at"] = time.time() - 10
+    STATE["token_status"] = 503
+    assert await client.connected() is True
+    try:
+        await client.lists()
+        raise AssertionError("503 ignored")
+    except B.BringAuthError:
+        raise AssertionError("503 treated as a bad login")
+    except B.BringError:
+        assert store.data and store.login
+
+    client.forget()  # bring_disconnect removes everything
+    assert store.data is None and store.login is None
+
+
+def test_saved_login():
+    asyncio.run(_saved_login_flow())
 
 
 if __name__ == "__main__":

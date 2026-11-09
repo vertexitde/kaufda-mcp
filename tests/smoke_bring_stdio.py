@@ -27,7 +27,7 @@ async def main():
             print("bring_status:", (await call("bring_status"))[1])
             err, text = await call("bring_connect")
             data = json.loads(text)
-            print("bring_connect:", err, data["login_url"][:40] + "...", "|", data["secure_storage"])
+            print("bring_connect:", err, data["login_url"][:40] + "...", "|", data["storage"])
             with urllib.request.urlopen(data["login_url"], timeout=5) as resp:
                 print("Login Seite:", resp.status, "Formular da:", "Bring! mit kaufDA verbinden" in resp.read().decode())
             err, text = await call("bring_add_items", items=[{"name": "Butter"}])

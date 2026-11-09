@@ -19,7 +19,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 from . import normalize as N
-from .bring import BringClient, BringError, KeyringStore, LoginPage, login_sync
+from .bring import BringAuthError, BringClient, BringError, CredentialStore, LoginPage, login_sync
 from .client import KaufdaClient, KaufdaError, check_uuid
 from .prefs import PreferenceStore
 
@@ -86,10 +86,14 @@ bring = BringClient()
 bring.attribute_type = prefs.load().get("bring_attribute_type") or bring.attribute_type
 
 
-def _bring_logged_in(session: dict[str, Any]) -> None:
-    """Login page callback (runs in the page's thread): keep the session tokens, never the password."""
+def _bring_logged_in(session: dict[str, Any], email: str, password: str, remember: bool) -> None:
+    """Login page callback (runs in the page's thread)."""
     try:
-        KeyringStore().save(session)
+        bring.store.save(session)
+        if remember:
+            bring.store.save_login(email, password)
+        else:
+            bring.store.delete_login()
     except BringError as exc:
         log.warning("Bring! session only kept in memory: %s", exc)
         session["source"] = "memory"
@@ -1150,18 +1154,16 @@ async def _bring_list(list_name: str | None) -> dict[str, str]:
 @mcp.tool()
 async def bring_status() -> str:
     """Is the user's Bring! account connected? Shows the account, the selected list and all lists."""
-    available, backend = KeyringStore.available()
     try:
         session = await bring.session()
-    except BringError:
-        return _dump(N.compact({
+        lists = await bring.lists()
+    except BringAuthError:
+        return _dump({
             "connected": False,
             "next_step": "bring_connect aufrufen und dem Nutzer den Login Link geben. Nie nach dem Passwort fragen.",
-            "secure_storage": backend if available else f"nicht verfügbar ({backend})",
-        }))
-    try:
-        lists = await bring.lists()
-    except BringError as exc:
+            "storage": bring.store.describe(),
+        })
+    except BringError as exc:  # Bring! briefly unreachable: no reason to make the user log in again
         raise ToolError(str(exc)) from exc
     selected = prefs.load().get("bring_list") or {}
     if not selected and len(lists) == 1:
@@ -1172,7 +1174,8 @@ async def bring_status() -> str:
         "selected_list": selected.get("name"),
         "lists": [entry["name"] for entry in lists],
         "stored": {"env": "Umgebungsvariablen", "memory": "nur bis zum Neustart"}.get(
-            session.get("source") or "", "sicher im Schlüsselspeicher des Systems"),
+            session.get("source") or "", bring.store.describe()),
+        "auto_login": bring.can_auto_login(),
     }
     if not selected.get("name"):
         out["next_step"] = "Nutzer fragen, welche Liste genutzt werden soll, dann bring_select_list."
@@ -1182,24 +1185,24 @@ async def bring_status() -> str:
 @mcp.tool()
 async def bring_connect() -> str:
     """Start the Bring! login: returns a one-time link to a local login page (on this computer, valid 10 minutes).
-    Give the link to the user; they enter their Bring! mail and password there, directly. Their password never
-    passes through the chat and is not stored, only the session token (in the system keychain).
+    Give the link to the user; they enter their Bring! mail and password there, directly, so the password never
+    passes through the chat. It is remembered on this computer (unless they untick it), so this is a one-time step.
     Never ask the user for the password yourself."""
     if await bring.connected():
         return _dump({"connected": True, "next_step": "Bereits verbunden, bring_status zeigt die Listen."})
-    available, backend = KeyringStore.available()
     url = await asyncio.to_thread(login_page.start)
     return _dump(N.compact({
         "login_url": url,
         "valid_minutes": 10,
         "tell_user": ("Öffne den Link im Browser auf diesem Rechner, melde dich mit deinen Bring! Zugangsdaten an "
                       "und sag mir danach kurz Bescheid."),
-        "secure_storage": backend if available else f"nicht verfügbar ({backend}): Sitzung gilt nur bis zum Neustart",
+        "storage": bring.store.describe(),
         "alternatives": {
-            "terminal": "kaufda-mcp bring-login (fragt Mail und Passwort im Terminal ab)",
+            "terminal": "kaufda-mcp bring-login auf dem Server ausführen (fragt Mail und Passwort ab, einmalig)",
             "server_or_bot": "Umgebungsvariablen BRING_EMAIL und BRING_PASSWORD für den MCP Server setzen",
         },
-        "note": "Der Link funktioniert nur auf dem Rechner, auf dem der MCP Server läuft.",
+        "note": ("Der Link funktioniert nur auf dem Rechner, auf dem der MCP Server läuft. Auf einem Server ohne "
+                 "Browser die Terminal Variante nehmen."),
     }))
 
 
@@ -1288,7 +1291,7 @@ async def bring_remove_items(
 
 @mcp.tool()
 async def bring_disconnect() -> str:
-    """Disconnect Bring!: deletes the stored session token from this computer."""
+    """Disconnect Bring!: deletes the session and the remembered mail and password from this computer."""
     bring.forget()
     data = prefs.load()
     data.pop("bring_list", None)
@@ -1327,33 +1330,36 @@ def _version() -> str:
 
 def _bring_cli(command: str) -> int:
     """Terminal helpers for Bring!, e.g. for servers without a browser."""
-    store = KeyringStore()
+    store = CredentialStore()
     if command == "bring-logout":
         store.delete()
-        print("Bring! Sitzung gelöscht.")
+        store.delete_login()
+        print("Bring! Sitzung und gemerkte Zugangsdaten gelöscht.")
         return 0
     if command == "bring-login":
         import getpass
 
-        available, backend = KeyringStore.available()
-        if not available:
-            print(f"Kein Schlüsselspeicher verfügbar ({backend}). Nutze BRING_EMAIL und BRING_PASSWORD.")
-            return 1
         email = input("Bring! Mailadresse: ").strip()
-        password = getpass.getpass("Bring! Passwort (wird nicht gespeichert): ")
+        password = getpass.getpass("Bring! Passwort: ")
+        remember = input("Dauerhaft merken? [J/n] ").strip().lower() not in ("n", "nein", "no")
         try:
             session = login_sync(email, password)
             store.save(session)
+            if remember:
+                store.save_login(email, password)
+            else:
+                store.delete_login()
         except BringError as exc:
             print(f"Fehler: {exc}")
             return 1
-        print(f"Verbunden als {session.get('email')}. Gespeichert im Schlüsselspeicher ({backend}).")
+        print(f"Verbunden als {session.get('email')}.")
     try:
         lists = asyncio.run(BringClient(store).lists())
     except BringError as exc:
         print(f"Nicht verbunden: {exc}")
         return 1
     print("Bring! Listen: " + ", ".join(entry["name"] for entry in lists))
+    print(f"Gespeichert in: {store.describe()}")
     return 0
 
 
